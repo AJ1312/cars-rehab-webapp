@@ -18,6 +18,8 @@ export interface ViewObj {
   progress: number; hot: boolean; touchR: number; bornMs: number; stateMs: number;
   /** World height of the object in metres, and a cosmetic variant (colour / spin) so no two look alike. */
   size: number; variant: number;
+  /** Angular modes: half width / half height (m, at the 50 cm sphere) of the area where the crosshair counts as touching. */
+  zoneHW?: number; zoneHH?: number;
 }
 export interface ViewGate { pos: V3; r: number; yaw: number; active: boolean; progress: number; hint: boolean }
 export interface ViewCam { view: Float32Array; proj?: Float32Array | null; viewport?: [number, number, number, number] | null; pos: V3 }
@@ -25,6 +27,8 @@ export interface ViewFrame {
   nowMs: number; cam: ViewCam | null; kind: 'linear' | 'angular';
   objects: ViewObj[]; gate: ViewGate | null;
   reticle: { show: boolean; progress: number; hot: boolean };
+  /** Position tracking: a small crosshair in the middle of the screen (where the phone points). */
+  cross: boolean;
   /** Draw a floor grid at this height (used when there is no camera picture behind). */
   gridY: number | null; tracking: 'ok' | 'lost' | 'waiting';
 }
@@ -295,7 +299,7 @@ export class ArView {
       const zoneCol: V3 = o.state === 'correct' ? hexRgb(PALETTE.green) : o.state === 'wrong' ? hexRgb(PALETTE.coral) : o.hot ? hexRgb(PALETTE.green) : [1, 1, 1];
       const zoneA = o.state === 'disabled' ? 0.12 : o.hot ? 0.95 : 0.42;
       const ring = Math.min(o.touchR * 2, Math.max(0.05, o.size * 1.5)) * ease;
-      this.drawSprite(gl, this.label('zone', '', ''), o.pos, ring, ring, [zoneCol[0], zoneCol[1], zoneCol[2], zoneA * (o.state === 'correct' ? Math.max(0, 1 - (now - o.stateMs) / 500) : 1)]);
+      if (o.zoneHW == null || o.kind === 'dot') this.drawSprite(gl, this.label('zone', '', ''), o.pos, ring, ring, [zoneCol[0], zoneCol[1], zoneCol[2], zoneA * (o.state === 'correct' ? Math.max(0, 1 - (now - o.stateMs) / 500) : 1)]);
       if (o.kind === 'num' || o.kind === 'word' || o.kind === 'dot') {
         const t = this.label(o.kind, o.label || '', o.kind === 'num' ? NUM_FILLS[o.variant % NUM_FILLS.length] : o.ink || '#fff');
         const h = o.size * ease * (o.hot && o.state === 'idle' ? 1.1 : 1) * (o.state === 'correct' ? 1 + 0.4 * Math.min(1, (now - o.stateMs) / 380) : 1);
@@ -386,7 +390,7 @@ export class ArView {
         let text: string;
         if (f.kind === 'linear') text = Math.round(dl * 100) + ' cm';
         else { const dot = (dx * fwd[0] + dy * fwd[1] + dz * fwd[2]) / dl; text = Math.round(Math.acos(Math.max(-1, Math.min(1, dot))) * 180 / Math.PI) + '°'; }
-        const on = !!pr && pr.z > 0.02 && pr.x > edge.l && pr.x < edge.r && pr.y > edge.t && pr.y < edge.b;
+        const on = !!pr && pr.z > 0.02 && pr.x > 6 && pr.x < this.W - 6 && pr.y > 6 && pr.y < this.H - 6;   // the guide arrow is only for objects that are really off the screen
         if (on) return { on, pr, text };
         // direction on screen (towards the object, even if it is behind the camera)
         let dirx: number, diry: number;
@@ -412,13 +416,33 @@ export class ArView {
           continue;
         }
         const gr = guide(o.pos, f.objects.length === 1 ? PALETTE.yellow : PALETTE.cobaltSoft, '');
-        if (gr.on && gr.pr && o.progress > 0.01) {
+        if (gr.on && gr.pr && o.zoneHW != null && o.zoneHH != null && (o.hot || o.progress > 0.01)) {
+          // aiming modes: an outline around the object itself; it fills as the hold completes
+          const hw = this.pxRadius(proj, gr.pr.z, o.zoneHW), hh = this.pxRadius(proj, gr.pr.z, o.zoneHH);
+          this.boxProgress(g, gr.pr.x, gr.pr.y, hw, hh, o.progress);
+        } else if (gr.on && gr.pr && o.progress > 0.01) {
           // dwell progress arc around the touch zone
           const rpx = Math.min(150, Math.max(18, this.pxRadius(proj, gr.pr.z, o.touchR) + 6));
           g.lineWidth = 8; g.lineCap = 'round'; g.strokeStyle = 'rgba(20,27,45,0.85)';
           g.beginPath(); g.arc(gr.pr.x, gr.pr.y, rpx, -Math.PI / 2, -Math.PI / 2 + o.progress * Math.PI * 2); g.stroke();
           g.lineWidth = 4.5; g.strokeStyle = PALETTE.green;
           g.beginPath(); g.arc(gr.pr.x, gr.pr.y, rpx, -Math.PI / 2, -Math.PI / 2 + o.progress * Math.PI * 2); g.stroke();
+        }
+      }
+      // position tracking: how far the nearest object still is, so depth is readable on a flat screen
+      if (f.kind === 'linear') {
+        let near: ViewObj | null = null; let nd = Infinity;
+        for (const o of f.objects) { if (o.state !== 'idle') continue; const dd = Math.sqrt(dist2(o.pos, cam)); if (dd < nd) { nd = dd; near = o; } }
+        if (near) {
+          const pr = this.project(view, proj, near.pos);
+          if (pr && pr.z > 0.02 && pr.x > 30 && pr.x < this.W - 30 && pr.y > 6 && pr.y < this.H - 6) {
+            const label = Math.max(0, Math.round((nd - near.touchR) * 100)) + ' cm to go';
+            const y = Math.min(this.H - 110, pr.y + Math.max(26, this.pxRadius(proj, pr.z, near.size / 2)) + 16);
+            g.font = `700 13px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+            const w = g.measureText(label).width + 16;
+            g.fillStyle = PALETTE.ink; g.beginPath(); g.roundRect ? g.roundRect(pr.x - w / 2, y - 11, w, 22, 11) : g.rect(pr.x - w / 2, y - 11, w, 22); g.fill();
+            g.fillStyle = PALETTE.paper; g.fillText(label, pr.x, y + 1);
+          }
         }
       }
       // gate (home ring)
@@ -438,6 +462,8 @@ export class ArView {
       }
     }
 
+    // crosshair (position tracking): shows where the phone points; touching is done with the phone itself
+    if (f.cross && !f.reticle.show) this.crosshair(g, cx, cy);
     // reticle (angular modes: the phone's aim is the centre of the screen)
     if (f.reticle.show) this.reticle(g, cx, cy, f.reticle.progress, f.reticle.hot);
     // at the start ring (position tracking): the same ring in the middle of the screen counts the hold
@@ -467,6 +493,29 @@ export class ArView {
     if (age > 400) return;
     g.save(); g.globalAlpha = 1 - age / 400; g.strokeStyle = PALETTE.coral; g.lineWidth = 6;
     g.beginPath(); g.arc(x, y, r * (1 + age / 400), 0, Math.PI * 2); g.stroke(); g.restore();
+  }
+
+  /** Rounded box around an object; the green part grows with the hold. */
+  private boxProgress(g: CanvasRenderingContext2D, x: number, y: number, hw: number, hh: number, progress: number) {
+    const w = Math.max(30, hw * 2), h = Math.max(30, hh * 2), r = Math.min(h / 2, 18);
+    const path = () => { g.beginPath(); g.roundRect ? g.roundRect(x - w / 2, y - h / 2, w, h, r) : g.rect(x - w / 2, y - h / 2, w, h); };
+    const per = 2 * (w + h) - (8 - 2 * Math.PI) * r;
+    g.save(); g.lineCap = 'round';
+    g.setLineDash([]); g.lineWidth = 7; g.strokeStyle = 'rgba(20,27,45,0.85)'; path(); g.stroke();
+    g.lineWidth = 4; g.strokeStyle = progress > 0.01 ? 'rgba(246,241,231,0.55)' : PALETTE.green; path(); g.stroke();
+    if (progress > 0.01) { g.setLineDash([Math.max(1, per * Math.min(1, progress)), per * 2]); g.lineWidth = 5; g.strokeStyle = PALETTE.green; path(); g.stroke(); }
+    g.restore();
+  }
+
+  private crosshair(g: CanvasRenderingContext2D, x: number, y: number) {
+    // The same look as the aiming ring, a little lighter: in position tracking it only shows where the phone points.
+    g.save(); g.lineCap = 'round';
+    for (const [w, c] of [[6, 'rgba(20,27,45,0.85)'], [2.6, PALETTE.paper]] as [number, string][]) {
+      g.lineWidth = w; g.strokeStyle = c;
+      g.beginPath(); g.arc(x, y, 22, 0, Math.PI * 2); g.stroke();
+      g.beginPath(); g.moveTo(x - 9, y); g.lineTo(x + 9, y); g.moveTo(x, y - 9); g.lineTo(x, y + 9); g.stroke();
+    }
+    g.restore();
   }
 
   private reticle(g: CanvasRenderingContext2D, x: number, y: number, progress: number, hot: boolean) {

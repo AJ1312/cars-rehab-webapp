@@ -87,8 +87,8 @@ export class XrSensor implements Sensor {
         domOverlay: { root: overlayRoot }
       });
     } catch (e: any) {
-      const why = e?.name === 'SecurityError' ? 'Camera access was declined.' : 'AR could not start. On Android it needs Chrome with Google Play Services for AR installed, and camera access allowed.';
-      throw new Error(why);
+      const why = e?.name === 'SecurityError' ? 'Camera access was declined.' : 'AR could not start. On Android it needs Chrome (or Samsung Internet) with Google Play Services for AR installed, and camera access allowed. If it keeps failing, go back and use Change tracking mode > Motion tracking.';
+      throw new Error(why + (e?.name ? ` (${e.name}${e.message ? ': ' + String(e.message).slice(0, 120) : ''})` : ''));
     }
     this.session = session;
     // Taps on the on-screen buttons must not also count as an AR "select".
@@ -98,7 +98,8 @@ export class XrSensor implements Sensor {
     if (!gl) { try { await session.end(); } catch { /* ignore */ } throw new Error('WebGL is not available.'); }
     this.gl = gl;
     await (gl as any).makeXRCompatible?.();
-    session.updateRenderState({ baseLayer: new (window as any).XRWebGLLayer(session, gl, { alpha: true, depth: true, antialias: true }) });
+    // depthNear: the default 0.1 m hides an object just before the phone reaches it (touch is at 7 cm), so the near plane is pulled in.
+    session.updateRenderState({ baseLayer: new (window as any).XRWebGLLayer(session, gl, { alpha: true, depth: true, antialias: true }), depthNear: 0.02, depthFar: 8 });
     this.space = await session.requestReferenceSpace('local');
     session.addEventListener('end', () => { this.session = null; this.onEnd?.('xr-ended'); });
   }

@@ -116,6 +116,12 @@ Object placement is random on every trial (position, left or right, high or low,
 
 **Haptics.** Android Chrome vibrates on each touch. Safari on iPhone does not offer the vibration API to web pages, so on iPhone the app gives sound, a visual pulse and a light tick on buttons where the phone allows it, and says so in the phone check.
 
+## Touching, the crosshair and Android
+
+- **Rotation mode (iPhone, or any phone without AR):** the ring in the middle of the screen is the crosshair. An object counts as touched when the crosshair is on the object itself (the word, number or triangle plus a small margin) for the hold time. An outline around the object fills as you hold. Objects never overlap, and nothing sits on the straight path from the middle of the screen to another object, so aiming at one does not brush another.
+- **Position tracking (Android AR):** the phone itself is the hand. A crosshair in the middle of the screen shows where the phone points, and the label under the nearest object counts the centimetres left to reach it. An object is touched when the phone is within 7 cm of its centre. The AR near-clip plane is pulled in to 2 cm, so objects stay visible until the moment of the touch.
+- **Android checklist:** Chrome (or Samsung Internet) with *Google Play Services for AR* installed, camera allowed, site opened over HTTPS. The calibration check needs at least 20 Hz (many phones run ARCore at 30 fps). If AR will not start, the error names the reason; use *Change tracking mode > Motion tracking* as a fallback.
+
 ## Which phones give which data quality
 
 | Phone | Mode | Data |

@@ -58,6 +58,8 @@ interface Target {
   id: number; kind: ObjKind; pos: V3; zone: string; az: number; el: number; reachCm: number;
   /** World height (m), depth from the phone (cm), screen position (-1..1) and a cosmetic variant. */
   size: number; depthCm: number; ndc: [number, number]; variant: number;
+  /** Angular modes: half width / half height of the hit area in degrees (the object plus a small margin). null = a sphere around the object. */
+  hw: number | null; hh: number | null;
   opt: any | null; state: 'idle' | 'disabled' | 'wrong' | 'correct';
   dwell: number; enteredT: number | null; enteredP: V3 | null; stateT: number; bornT: number; hot: boolean;
 }
@@ -345,8 +347,10 @@ export class Engine {
   }
   private resync() { if (this.item) { this.item.tracker.last = this.curVec(); this.item.tracker.lastT = this.gms; } this.lastKin = null; }
   private mkTarget(pl: { pos: V3; az: number; el: number; zone: string; reachCm: number; size?: number; depthCm?: number; ndc?: [number, number] }, kind: ObjKind, opt: any): Target {
+    const size = pl.size ?? 0.07;
+    const box = this.kind === 'angular' ? (core.hitBox(kind, size) as { hw: number; hh: number }) : null;
     return { id: this.idSeq++, kind, pos: pl.pos, zone: pl.zone, az: pl.az, el: pl.el, reachCm: pl.reachCm,
-      size: pl.size ?? 0.07, depthCm: pl.depthCm ?? pl.reachCm, ndc: pl.ndc ?? [0, 0], variant: Math.floor(Math.random() * 6), opt, state: 'idle', dwell: 0, enteredT: null, enteredP: null, stateT: 0, bornT: performance.now(), hot: false };
+      size, depthCm: pl.depthCm ?? pl.reachCm, ndc: pl.ndc ?? [0, 0], variant: Math.floor(Math.random() * 6), hw: box ? box.hw : null, hh: box ? box.hh : null, opt, state: 'idle', dwell: 0, enteredT: null, enteredP: null, stateT: 0, bornT: performance.now(), hot: false };
   }
 
   /* ---------------- per-frame processing ---------------- */
@@ -538,9 +542,19 @@ export class Engine {
     const c = this.curVec();
     for (const tg of targets) {
       if (tg.state !== 'idle') { tg.hot = false; continue; }
-      const d = core.v3.dist(c, tg.pos);
-      const inside = d <= (tg.enteredT != null ? this.touchR * 1.25 : this.touchR);
-      tg.hot = d <= this.touchR;
+      let d: number; let inside: boolean;
+      if (tg.hw != null && tg.hh != null) {
+        // Aiming: the crosshair has to be on the object itself (plus a small margin). d is 1 at the edge of that area.
+        const [oa, oe] = core.angularOffset(c, tg.pos, this.ahead) as number[];
+        const k = tg.enteredT != null ? 1.2 : 1;
+        d = Math.hypot(oa / tg.hw, oe / tg.hh);
+        inside = Math.abs(oa) <= tg.hw * k && Math.abs(oe) <= tg.hh * k;
+        tg.hot = Math.abs(oa) <= tg.hw && Math.abs(oe) <= tg.hh;
+      } else {
+        d = core.v3.dist(c, tg.pos);
+        inside = d <= (tg.enteredT != null ? this.touchR * 1.25 : this.touchR);
+        tg.hot = d <= this.touchR;
+      }
       if (inside) {
         if (tg.enteredT == null) { tg.enteredT = this.gms; tg.enteredP = c; tg.dwell = 0; haptic('tick'); }
         tg.dwell += dt;
@@ -777,7 +791,8 @@ export class Engine {
     const objects: ViewObj[] = [];
     const toObj = (tg: Target): ViewObj => ({
       id: tg.id, kind: tg.kind, pos: core.calToWorld(this.cal, tg.pos) as V3, label: tg.opt ? tg.opt.label : undefined, ink: tg.opt?.inkHex,
-      state: tg.state, progress: tg.state === 'idle' ? Math.min(1, tg.dwell / this.cfg.dwellMs) : 0, hot: tg.hot, touchR: this.touchR, bornMs: tg.bornT, stateMs: tg.stateT, size: tg.size, variant: tg.variant
+      state: tg.state, progress: tg.state === 'idle' ? Math.min(1, tg.dwell / this.cfg.dwellMs) : 0, hot: tg.hot, touchR: this.touchR, bornMs: tg.bornT, stateMs: tg.stateT, size: tg.size, variant: tg.variant,
+      zoneHW: tg.hw != null ? this.ahead * Math.tan(tg.hw * core.DEG) : undefined, zoneHH: tg.hh != null ? this.ahead * Math.tan(tg.hh * core.DEG) : undefined
     });
     let best = 0; let anyHot = false;
     if (this.cal) {
@@ -795,10 +810,12 @@ export class Engine {
     } : null;
     const homeProg = this.sub === 'home' && phase === 'playing' ? Math.min(1, this.homeHold / HOME_HOLD_MS) : 0;
     const reticleProgress = phase === 'cal_hold' ? this.snap.cal.progress : homeProg > 0 ? homeProg : best;
-    const reticleShow = this.kind === 'angular' && (worldOn || phase === 'cal_ready' || phase === 'cal_hold' || phase === 'cal_result');
+    const aimPhase = worldOn || phase === 'cal_ready' || phase === 'cal_hold' || phase === 'cal_result';
+    const reticleShow = this.kind === 'angular' && aimPhase;
     const frame: ViewFrame = {
       nowMs: now, cam, kind: this.kind, objects, gate,
       reticle: { show: reticleShow, progress: reticleProgress, hot: anyHot || (inHome && phase === 'playing' && this.sub === 'home') },
+      cross: this.kind === 'linear' && aimPhase,
       gridY: !this.cameraLive && cam ? this.calEye[1] - 0.9 : null,
       tracking
     };

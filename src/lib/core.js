@@ -78,7 +78,7 @@
   ];
 
   const CAL_RULES = {
-    minRateHz: { '6dof': 30, motion: 20, touch: 20, sim: 20 },
+    minRateHz: { '6dof': 20, motion: 20, touch: 20, sim: 20 },   // ARCore runs at 30 fps on many Android phones, which measures a little under 30 Hz
     maxJitterCm: 1.0,
     holdMs: 2000
   };
@@ -259,9 +259,9 @@
   // "How close do you want it?": nearer = objects closer to the phone and packed towards the middle,
   // far = objects further away, smaller and spread over the whole screen.
   const DISTANCES = {
-    near: { key: 'near', label: 'Close', depthF: 0.8, spread: 0.74, size: 1.06, gap: 0.05 },
-    medium: { key: 'medium', label: 'Medium', depthF: 1.0, spread: 0.86, size: 1.0, gap: 0.08 },
-    far: { key: 'far', label: 'Far', depthF: 1.25, spread: 1.0, size: 0.9, gap: 0.11 }
+    near: { key: 'near', label: 'Close', depthF: 0.8, spread: 0.74, size: 1.06, gap: 0.09 },
+    medium: { key: 'medium', label: 'Medium', depthF: 1.0, spread: 0.86, size: 1.0, gap: 0.11 },
+    far: { key: 'far', label: 'Far', depthF: 1.25, spread: 1.0, size: 0.9, gap: 0.14 }
   };
   const DISTANCE_KEYS = ['near', 'medium', 'far'];
   // Size of the triangles, numbers and words (a multiplier on their apparent size).
@@ -275,7 +275,7 @@
     dot: { deg: 8, ar: 1 }
   };
   // Parts of the screen that must stay clear (normalised device coordinates).
-  const SCREEN = { top: 0.77, bottom: -0.73, side: 0.88, promptBand: 0.13, centreR: 0.14 };
+  const SCREEN = { top: 0.77, bottom: -0.73, side: 0.88, promptBand: 0.2, centreR: 0.17 };
   const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 
   // How many objects are on the screen at once, per difficulty level.
@@ -302,6 +302,45 @@
     const dir = v3.norm([nx * view.tanY * view.aspect, ny * view.tanY, -1]);
     return v3.scale(dir, d);
   }
+
+  // Angular modes (aiming): the hit area of an object is the object itself plus a small margin, so "the crosshair is on the word"
+  // is exactly what counts. Half sizes in degrees.
+  const ZONE_PAD_DEG = 1.2;
+  function hitBox(kind, sizeM) {
+    const spec = OBJ[kind] || OBJ.num;
+    const hAng = (2 * Math.atan(sizeM / 2 / AHEAD_ANGULAR_M)) / DEG;
+    return { hw: (hAng * spec.ar) / 2 + ZONE_PAD_DEG, hh: hAng / 2 + ZONE_PAD_DEG };
+  }
+  // Offset of the aim point from an object, in degrees (azimuth scaled by cos(elevation), so it is a true on-screen offset).
+  // Both are points on the sphere around the phone; the sphere's centre is `ahead` behind the calibration origin.
+  function angularOffset(aim, tgt, ahead) {
+    const a = [aim[0], aim[1], aim[2] + ahead], t = [tgt[0], tgt[1], tgt[2] + ahead];
+    const azA = Math.atan2(a[0], a[2]), azT = Math.atan2(t[0], t[2]);
+    const elA = Math.atan2(a[1], Math.hypot(a[0], a[2])), elT = Math.atan2(t[1], Math.hypot(t[0], t[2]));
+    let dz = azA - azT; while (dz > Math.PI) dz -= 2 * Math.PI; while (dz < -Math.PI) dz += 2 * Math.PI;
+    return [(dz * Math.cos(elT)) / DEG, (elA - elT) / DEG];
+  }
+
+  // Does the straight path from the middle of the screen to B run through A's box (plus a margin)? Units: half screen heights.
+  const screenLaneBlocked = (A, B, aspect, m) => {
+    const ax = A.nx * aspect, ay = A.ny, bx = B.nx * aspect, by = B.ny;
+    if (Math.hypot(ax, ay) >= Math.hypot(bx, by)) return false;   // A is not in front of B
+    const hx = A.wU / 2 + m, hy = A.hU / 2 + m;
+    let t0 = 0, t1 = 1;
+    for (const [d, lo, hi] of [[bx, ax - hx, ax + hx], [by, ay - hy, ay + hy]]) {
+      if (Math.abs(d) < 1e-9) { if (lo > 0 || hi < 0) return false; continue; }
+      let ta = lo / d, tb = hi / d; if (ta > tb) { const x = ta; ta = tb; tb = x; }
+      t0 = Math.max(t0, ta); t1 = Math.min(t1, tb); if (t0 > t1) return false;
+    }
+    return true;
+  };
+  // Position tracking: does the hand's straight path from where it is (the origin) to B pass within r of A?
+  const handLaneBlocked = (A, B, r) => {
+    const q = B.pc, p = A.pc, qq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] || 1e-9;
+    const t = Math.max(0, Math.min(1, (p[0] * q[0] + p[1] * q[1] + p[2] * q[2]) / qq));
+    const dx = p[0] - t * q[0], dy = p[1] - t * q[1], dz = p[2] - t * q[2];
+    return t < 1 && Math.hypot(dx, dy, dz) < r;
+  };
 
   const overlapGap = (a, b, gap) => {
     // both in half-height units: do the two boxes (plus a gap) overlap?
@@ -335,6 +374,7 @@
       // Nothing fits? Make everything a little smaller (and a little further away) and try again.
       const grow = linear ? 1 + 0.04 * Math.min(round, 5) : 1;
       const shrink = Math.max(0.55, 1 - 0.06 * round);
+      const relax = round < 3 ? 1 : Math.max(0.55, 1 - 0.07 * (round - 2));   // from the fourth round the gaps and the clear band in the middle give a little
       const found = [];
       for (let attempt = 0; attempt < 30 && found.length < 3; attempt++) {
         const objs = [];
@@ -352,7 +392,7 @@
             const yHi = Math.max(0.12, SCREEN.top - halfY) * P.spread, yLo = -Math.max(0.12, -SCREEN.bottom - halfY) * P.spread;
             const nx = (rng.next() * 2 - 1) * xHi;
             const ny = yLo + rng.next() * (yHi - yLo);
-            if (opts.band ? Math.abs(ny) - halfY < SCREEN.promptBand : Math.hypot(nx * aspect, ny) < SCREEN.centreR + Math.max(wU, hU) / 2) continue;
+            if (opts.band ? Math.abs(ny) - halfY < SCREEN.promptBand * relax : Math.hypot(nx * aspect, ny) < SCREEN.centreR * relax + Math.max(wU, hU) / 2) continue;
             const pc = rayPoint(view, nx, ny, d);
             // Keep clear of places the participant has just been (the hand and the previous set), so every new reach is a real movement.
             if (opts.avoid && opts.avoid.length && view.toCal) {
@@ -363,7 +403,11 @@
             const cand = { kind: kinds[i], nx, ny, d, pc, size, wU, hU, aspect };
             let clash = false;
             for (const o of objs) {
-              if (overlapGap(cand, o, P.gap) || (round < 6 && minSep3D && v3.dist(pc, o.pc) < minSep3D)) { clash = true; break; }
+              if (overlapGap(cand, o, P.gap * relax) || (round < 6 && minSep3D && v3.dist(pc, o.pc) < minSep3D)) { clash = true; break; }
+              // Nothing sits on the way to something else, so moving to one object never brushes another.
+              if (round < 5 && (linear
+                ? (handLaneBlocked(o, cand, TOUCH_RADIUS_LINEAR_M + 0.025) || handLaneBlocked(cand, o, TOUCH_RADIUS_LINEAR_M + 0.025))
+                : (screenLaneBlocked(o, cand, aspect, 0.05) || screenLaneBlocked(cand, o, aspect, 0.05)))) { clash = true; break; }
             }
             if (!clash) placed = cand;
           }
@@ -1516,7 +1560,7 @@
     VERSION, GAMES, GAME_ORDER, LEVELS, DIRS, DIR_NAMES, COLOURS, CAL_RULES, QUESTIONS, COLS,
     TARGET_RADIUS_M, TOUCH_RADIUS_LINEAR_M, HOME_RADIUS_M, AHEAD_ANGULAR_M, AHEAD_6DOF_M, DEG, DISTANCES, DISTANCE_KEYS, OBJECT_SIZES, SIZE_KEYS, OBJ, SCREEN,
     makeRng, v3, quat, deviceOrientationToQuat, forwardOf, yawPitchRoll, yawPitchToward, cursorFromPose,
-    PROTOCOL, ADVERSE_TAGS, adverseLabel, sequenceLabel, ORDER_MODES, buildSchedule, makeCalibration, calToWorld, toCalFrame, angDiff, dirName, reachRadius, depthRange, objectCount, rayPoint, layoutOnScreen, zoneOf, rangePoint, makePlacer, layoutOptions, makeItemSource,
+    PROTOCOL, ADVERSE_TAGS, adverseLabel, sequenceLabel, ORDER_MODES, buildSchedule, makeCalibration, calToWorld, toCalFrame, angDiff, dirName, reachRadius, depthRange, objectCount, rayPoint, layoutOnScreen, hitBox, angularOffset, ZONE_PAD_DEG, zoneOf, rangePoint, makePlacer, layoutOptions, makeItemSource,
     
     OneEuro3, TrackingHealth, measureCalibration, ReachTracker,
     round, mean, median, sd,

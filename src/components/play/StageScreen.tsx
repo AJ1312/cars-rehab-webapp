@@ -207,7 +207,7 @@ export function StageScreen({ cfg, onFinished, onExit }: { cfg: SessionConfig; o
           <span className="tag">{modeTag}</span>
           <h2>Ready to start</h2>
           <p>{xr
-            ? 'The camera opens and 3D targets appear around you in the room. Hold or strap the phone on your hand and reach out to touch them with it.'
+            ? 'The camera opens and 3D targets appear around you in the room. Hold or strap the phone on your hand and reach out to touch them with the phone itself. The + in the middle shows where the phone points, and the label under the nearest target counts the centimetres left.'
             : cfg.mode === 'motion'
               ? 'The camera opens and targets appear around you in the room. Turn the phone so the ring in the middle of the screen lands on a target, and hold.'
               : cfg.mode === 'touch'

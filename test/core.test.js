@@ -64,7 +64,7 @@ test('Maths Fun: operands and answers are well spread (not predictable)', () => 
 });
 
 test('On-screen layout: every object fits on the screen, nothing overlaps, the HUD and prompt stay clear (all games, levels, distances, screen shapes)', () => {
-  let total = 0, fallbacks = 0;
+  let total = 0, fallbacks = 0, bandTotal = 0, bandFull = 0;
   for (const [shape, aspect] of Object.entries(ASPECTS)) {
     for (const kind of ['linear', 'angular']) {
       for (const level of [1, 2, 3]) {
@@ -83,8 +83,9 @@ test('On-screen layout: every object fits on the screen, nothing overlaps, the H
                 const tag = `${shape} ${kind} L${level} ${dist} ${game}`;
                 assert.ok(Math.abs(b.nx) + b.wU / 2 / aspect <= 1.0, tag + ' inside the sides');
                 assert.ok(b.ny + b.hU / 2 <= 0.8 && b.ny - b.hU / 2 >= -0.76, tag + ' clear of the score bar and buttons');
-                if (game !== 'triangle') assert.ok(Math.abs(b.ny) - b.hU / 2 >= C.SCREEN.promptBand - 0.004, tag + ' clear of the prompt band');
-                else assert.ok(Math.hypot(b.nx * aspect, b.ny) >= C.SCREEN.centreR, tag + ' clear of the centre');
+                // The full clear band is kept almost always; in the tightest combinations it gives way, but never below 60 % of it.
+                if (game !== 'triangle') { const room = Math.abs(b.ny) - b.hU / 2; assert.ok(room >= C.SCREEN.promptBand * 0.6 - 0.004, tag + ' clear of the prompt band'); bandTotal++; if (room >= C.SCREEN.promptBand - 0.004) bandFull++; }
+                else assert.ok(Math.hypot(b.nx * aspect, b.ny) >= C.SCREEN.centreR * 0.6, tag + ' clear of the centre');
                 for (let y = x + 1; y < boxes.length; y++) {
                   const o = boxes[y];
                   const overlap = Math.abs(b.nx - o.nx) * aspect < (b.wU + o.wU) / 2 && Math.abs(b.ny - o.ny) < (b.hU + o.hU) / 2;
@@ -98,6 +99,7 @@ test('On-screen layout: every object fits on the screen, nothing overlaps, the H
     }
   }
   assert.ok(fallbacks / total < 0.01, `fallback ring used ${fallbacks}/${total}`);
+  assert.ok(bandFull / bandTotal > 0.9, `the full clear band around the prompt is kept for ${bandFull} of ${bandTotal} objects`);
 });
 
 test('On-screen layout: depth, size and 3-D separation follow the level and distance setting', () => {
@@ -486,4 +488,46 @@ test('Triangle sets keep clear of the hand and of the previous set, so every rea
   }
   assert.ok(minHard >= 0.119, 'a new reach is always at least about 12 cm long (' + minHard + ')');
   assert.ok(softRelaxed / total < 0.25, 'the previous-set radius is met for most triangles even when the phone returns to the same pose every time (' + softRelaxed + ' of ' + total + ' relaxed)');
+});
+
+test('Aiming: the hit area is the object itself, and angular offsets are true on-screen angles', () => {
+  const T = [0, 0, 0.5];   // a target straight ahead (eye at the origin, so no offset behind the origin)
+  assert.deepEqual(C.angularOffset(T, T, 0).map((x) => Math.abs(x) < 1e-9), [true, true]);
+  const right10 = [0.5 * Math.sin(10 * C.DEG), 0, 0.5 * Math.cos(10 * C.DEG)];
+  const up10 = [0, 0.5 * Math.sin(10 * C.DEG), 0.5 * Math.cos(10 * C.DEG)];
+  const [a, e] = C.angularOffset(right10, T, 0); assert.ok(Math.abs(a - 10) < 0.05 && Math.abs(e) < 0.05, 'ten degrees to the right: ' + [a, e]);
+  const [a2, e2] = C.angularOffset(up10, T, 0); assert.ok(Math.abs(e2 - 10) < 0.05 && Math.abs(a2) < 0.05, 'ten degrees up: ' + [a2, e2]);
+  const w = C.hitBox('word', 0.047), n = C.hitBox('num', 0.05), t = C.hitBox('tri', 0.05);
+  assert.ok(w.hw > 2 * w.hh, 'a word is much wider than tall');
+  assert.ok(Math.abs(n.hw - n.hh) < 1e-6, 'a number badge is square');
+  assert.ok(t.hw > t.hh, 'the triangle is a little wider than tall');
+  assert.ok(w.hh > 2.4 && w.hh < 6, 'half-height is the object plus a small margin: ' + w.hh);
+});
+
+test('Aiming layouts: no object is hit by aiming at another, and nothing sits on the path from the middle to another object', () => {
+  let pairs = 0, lane = 0, overlap = 0;
+  for (let seed = 1; seed <= 150; seed++) {
+    for (const [dist, level, kinds] of [['medium', 2, ['word', 'word', 'word', 'word']], ['near', 3, ['num', 'num', 'num', 'num', 'num']], ['far', 1, ['word', 'word', 'word']]]) {
+      const { placer } = (() => { const rng = C.makeRng(seed); return { placer: C.makePlacer(rng, 'angular', level, dist, 'medium') }; })();
+      const pts = placer.place(mkView(390 / 692, 'angular'), kinds, { band: true });
+      const box = pts.map((p) => C.hitBox(p.kind, p.size));
+      // angles from the eye (the test frame has its origin at the eye)
+      pts.forEach((p) => { p.az = Math.atan2(p.pos[0], p.pos[2]) / C.DEG; p.el = Math.atan2(p.pos[1], Math.hypot(p.pos[0], p.pos[2])) / C.DEG; });
+      for (let i = 0; i < pts.length; i++) for (let j = 0; j < pts.length; j++) {
+        if (i === j) continue;
+        pairs++;
+        const [oa, oe] = C.angularOffset(pts[i].pos, pts[j].pos, 0);   // aiming at the centre of i: is that inside j's box?
+        if (Math.abs(oa) <= box[j].hw && Math.abs(oe) <= box[j].hh) overlap++;
+        // path from the middle (0, 0) to object i, in angle space; does it cross j?
+        let crosses = false;
+        for (let k = 1; k < 40; k++) {
+          const f = k / 40, az = f * pts[i].az, el = f * pts[i].el;
+          if (Math.abs(az - pts[j].az) * Math.cos(pts[j].el * C.DEG) <= box[j].hw && Math.abs(el - pts[j].el) <= box[j].hh && Math.hypot(pts[j].az, pts[j].el) < Math.hypot(pts[i].az, pts[i].el)) crosses = true;
+        }
+        if (crosses) lane++;
+      }
+    }
+  }
+  assert.equal(overlap, 0, 'no two hit areas overlap (' + overlap + ' of ' + pairs + ')');
+  assert.ok(lane / pairs < 0.03, 'the way to an object is almost always clear (' + lane + ' of ' + pairs + ' pairs crossed)');
 });

@@ -14,7 +14,7 @@ This app's required changes to that design: Maths Fun (addition and subtraction,
 - **Rotation only (`motion`, iPhone).** Only orientation is known. Objects sit on a 50 cm sphere and "reach" is an angle in degrees. Distances in centimetres in these sessions are not hand distances.
 - **`touch` / `sim`.** Practice only.
 
-A touch is registered when the phone is within 7 cm of an object's centre for the hold time (default 250 ms). If two touch zones overlap, the nearest centre wins.
+A touch in position tracking is registered when the phone is within 7 cm of an object's centre for the hold time (default 250 ms). In rotation mode it is registered when the crosshair is inside the object's own outline plus a 1.2 degree margin for the hold time. If two zones overlap, the nearest centre wins. Layouts keep zones from overlapping and keep the path from the middle of the screen to each object clear of other objects. The calibration check requires a sensor rate of at least 20 Hz in every mode.
 
 ## Object placement (on-screen model)
 
