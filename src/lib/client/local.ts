@@ -1,0 +1,146 @@
+/* On-phone storage: device enrolment, study defaults, and an offline queue of finished sessions (IndexedDB). */
+import type { SessionInput, Settings } from '../schema';
+import { DEFAULT_SETTINGS } from '../schema';
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+export interface DeviceInfo { token: string; label: string }
+export interface StoredSession {
+  id: string; record: SessionInput; kin: any[][]; savedAt: string;
+  state: 'pending' | 'uploaded' | 'rejected'; kinUploaded: boolean; attempts: number; lastError: string | null; uploadedAt: string | null;
+}
+
+const LS_DEVICE = 'cars.device', LS_SETTINGS = 'cars.settings', LS_RECENT = 'cars.recent', LS_PREFS = 'cars.prefs';
+const lsGet = <T,>(k: string): T | null => { try { const v = localStorage.getItem(k); return v ? (JSON.parse(v) as T) : null; } catch { return null; } };
+const lsSet = (k: string, v: unknown) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage full or blocked */ } };
+
+export const getDevice = () => lsGet<DeviceInfo>(LS_DEVICE);
+export const setDevice = (d: DeviceInfo | null) => { if (d) lsSet(LS_DEVICE, d); else try { localStorage.removeItem(LS_DEVICE); } catch { /* ignore */ } };
+export const getSettings = (): Settings => ({ ...DEFAULT_SETTINGS, ...(lsGet<Settings>(LS_SETTINGS) || {}) });
+export const setSettings = (s: Settings) => lsSet(LS_SETTINGS, s);
+export const getRecent = (): string[] => lsGet<string[]>(LS_RECENT) || [];
+export const pushRecent = (code: string) => lsSet(LS_RECENT, [code, ...getRecent().filter((c) => c !== code)].slice(0, 12));
+export const getPrefs = <T,>() => lsGet<T>(LS_PREFS);
+export const setPrefs = (p: unknown) => lsSet(LS_PREFS, p);
+
+/* ---------------- IndexedDB ---------------- */
+let dbp: Promise<IDBDatabase> | null = null;
+function db(): Promise<IDBDatabase> {
+  if (!dbp) dbp = new Promise((res, rej) => {
+    const r = indexedDB.open('cars', 1);
+    r.onupgradeneeded = () => { r.result.createObjectStore('sessions', { keyPath: 'id' }); };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  return dbp;
+}
+async function tx<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T>): Promise<T> {
+  const d = await db();
+  return new Promise((res, rej) => { const r = fn(d.transaction('sessions', mode).objectStore('sessions')); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+}
+export const saveSession = (s: StoredSession) => tx('readwrite', (st) => st.put(s));
+export const allSessions = async (): Promise<StoredSession[]> => ((await tx('readonly', (st) => st.getAll())) as StoredSession[]).sort((a, b) => b.savedAt.localeCompare(a.savedAt));
+export const getSession = (id: string) => tx('readonly', (st) => st.get(id)) as Promise<StoredSession | undefined>;
+export const deleteSession = (id: string) => tx('readwrite', (st) => st.delete(id));
+
+export async function nextSessionNoLocal(code: string): Promise<number> {
+  const all = await allSessions();
+  return all.filter((s) => s.record.participantId === code).reduce((m, s) => Math.max(m, s.record.sessionNo), 0) + 1;
+}
+
+/* ---------------- talking to the server ---------------- */
+async function gzip(text: string): Promise<Blob> {
+  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Response(stream).blob();
+}
+
+async function api(path: string, init: RequestInit & { token?: string } = {}) {
+  const { token, ...rest } = init;
+  const headers = new Headers(rest.headers);
+  if (token) headers.set('Authorization', 'Bearer ' + token);
+  const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 30000);
+  try { return await fetch(path, { ...rest, headers, signal: ctl.signal, cache: 'no-store' }); } finally { clearTimeout(to); }
+}
+
+export async function enrolDevice(code: string): Promise<{ ok: true; device: DeviceInfo; settings: Settings } | { ok: false; error: string }> {
+  try {
+    const r = await api('/api/enrol', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, model: navigator.userAgent.slice(0, 190) }) });
+    const j = await r.json();
+    if (!r.ok) return { ok: false, error: j.error || 'Could not enrol' };
+    const device = { token: j.token, label: j.label };
+    setDevice(device); if (j.settings) setSettings(j.settings);
+    return { ok: true, device, settings: j.settings };
+  } catch { return { ok: false, error: 'No connection. Connect to the internet to enrol this phone.' }; }
+}
+
+export async function refreshConfig(): Promise<'ok' | 'revoked' | 'offline'> {
+  const d = getDevice(); if (!d) return 'offline';
+  try {
+    const r = await api('/api/config', { token: d.token });
+    if (r.status === 401) return 'revoked';
+    if (!r.ok) return 'offline';
+    const j = await r.json(); if (j.settings) setSettings(j.settings);
+    return 'ok';
+  } catch { return 'offline'; }
+}
+
+export async function nextSessionNo(code: string): Promise<number> {
+  const local = await nextSessionNoLocal(code);
+  const d = getDevice(); if (!d) return local;
+  try {
+    const r = await api('/api/participants/' + encodeURIComponent(code) + '/next', { token: d.token });
+    if (r.ok) { const j = await r.json(); return Math.max(local, j.next); }
+  } catch { /* offline: local number */ }
+  return local;
+}
+
+let syncing = false;
+export type SyncResult = { sent: number; failed: number; pending: number; revoked: boolean };
+/** Upload everything not yet on the server. Safe to call repeatedly: uploads are idempotent on the session id. */
+export async function syncAll(): Promise<SyncResult> {
+  const out: SyncResult = { sent: 0, failed: 0, pending: 0, revoked: false };
+  const d = getDevice();
+  if (!d || syncing || (typeof navigator !== 'undefined' && navigator.onLine === false)) { out.pending = (await allSessions()).filter((s) => s.state === 'pending').length; return out; }
+  syncing = true;
+  try {
+    for (const s of (await allSessions()).filter((x) => x.state === 'pending').reverse()) {
+      try {
+        const r = await api('/api/sessions', { method: 'POST', token: d.token, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...s.record, kinRows: s.kin.length }) });
+        if (r.status === 401) { out.revoked = true; break; }
+        if (r.status === 422 || r.status === 413) { const j = await r.json().catch(() => ({})); await saveSession({ ...s, state: 'rejected', lastError: (j.error || 'Rejected') + (j.issues ? ': ' + j.issues.join('; ') : ''), attempts: s.attempts + 1 }); out.failed++; continue; }
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        let kinOk = s.kinUploaded;
+        if (!kinOk && s.kin.length) {
+          const k = await api('/api/sessions/' + s.id + '/kin', { method: 'PUT', token: d.token, headers: { 'Content-Type': 'application/gzip' }, body: await gzip(JSON.stringify(s.kin)) });
+          if (!k.ok && k.status !== 413 && k.status !== 422) throw new Error('Movement file HTTP ' + k.status);
+          kinOk = k.ok;
+        } else kinOk = true;
+        await saveSession({ ...s, state: kinOk ? 'uploaded' : 'pending', kinUploaded: kinOk, uploadedAt: new Date().toISOString(), lastError: null, attempts: s.attempts + 1 });
+        out.sent++;
+      } catch (e: any) {
+        await saveSession({ ...s, attempts: s.attempts + 1, lastError: e?.message || 'Upload failed' });
+        out.failed++;
+      }
+    }
+  } finally { syncing = false; }
+  out.pending = (await allSessions()).filter((s) => s.state === 'pending').length;
+  return out;
+}
+
+/* ---------------- data sheet on the phone ---------------- */
+export async function buildSessionXlsx(s: StoredSession, history: StoredSession[]): Promise<{ name: string; blob: Blob }> {
+  const core = (await import('../core')).default;
+  const cs = { ...s.record, kin: s.kin };
+  const hist = history.filter((h) => h.id !== s.id && h.record.participantId === s.record.participantId).map((h) => ({ ...h.record }));
+  const bytes: Uint8Array = await core.buildXlsx(core.sessionWorkbookSpec(cs, hist));
+  return { name: core.sessionFileName(cs, 'xlsx'), blob: new Blob([bytes as BlobPart], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) };
+}
+export async function buildEventsCsv(s: StoredSession): Promise<{ name: string; blob: Blob }> {
+  const core = (await import('../core')).default;
+  const cs = { ...s.record };
+  return { name: core.sessionFileName(cs, 'csv').replace('.csv', '_events.csv'), blob: new Blob([core.eventsCsv(cs)], { type: 'text/csv;charset=utf-8' }) };
+}
+export function saveBlob(name: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
