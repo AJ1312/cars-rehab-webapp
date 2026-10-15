@@ -1,5 +1,5 @@
 'use client';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Brand } from '@/components/ui/Brand';
 import { GameGlyph } from '@/components/ui/Glyphs';
 import { allSessions, buildEventsCsv, buildSessionXlsx, saveBlob, syncAll, type StoredSession } from '@/lib/client/local';
@@ -20,12 +20,19 @@ const TABS: [string, string][] = [
 const KEY_OF: Record<string, GameKey> = { 'Triangle Reach': 'triangle', 'Maths Fun': 'maths', 'Colour Merge Test': 'colour' };
 const isIos = () => typeof navigator !== 'undefined' && (/iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
 
-export function Done({ id, load, onNew, onHistory }: { id: string; load: (id: string) => Promise<StoredSession | undefined>; onNew: (code?: string) => void; onHistory: () => void }) {
+export function Done({ id, load, onNew, onHistory, onHome }: { id: string; load: (id: string) => Promise<StoredSession | undefined>; onNew: (code?: string) => void; onHistory: () => void; onHome: () => void }) {
   const [s, setS] = useState<StoredSession | null | undefined>(undefined);
   const [games, setGames] = useState<any[]>([]);
   const [fileName, setFileName] = useState('');
+  const [played, setPlayed] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  // The workbook is built as soon as the session is on screen, so the button only has to hand the finished file over.
+  // That also matters on iPhone: the share sheet must be opened inside the tap, with nothing slow awaited first.
+  const [book, setBook] = useState<{ name: string; blob: Blob } | null>(null);
+  const [sheet, setSheet] = useState<'preparing' | 'ready' | 'error'>('preparing');
+  const latest = useRef<StoredSession | null>(null);
+  const builtFor = useRef<string>('');
 
   const refresh = useCallback(async () => { setS((await load(id)) ?? null); }, [id, load]);
   useEffect(() => { void refresh(); }, [refresh]);
@@ -40,17 +47,41 @@ export function Done({ id, load, onNew, onHistory }: { id: string; load: (id: st
       const core = (await import('@/lib/core')).default;
       setGames(core.summarizeGames(s.record));
       setFileName(core.sessionFileName(s.record, 'xlsx'));
+      setPlayed(core.sequenceLabel(s.record.sequence?.length ? s.record.sequence : s.record.games.flatMap((g: string) => Array(s.record.trialsPerGame).fill(g)), (g: string) => core.GAMES[g].name));
     })();
   }, [s]);
 
+  useEffect(() => { latest.current = s ?? null; });
+  const build = useCallback(async () => {
+    const cur = latest.current;
+    if (!cur) return;
+    setSheet('preparing');
+    try {
+      const f = await buildSessionXlsx(cur, await allSessions());
+      if (latest.current?.id !== cur.id) return;
+      setBook(f); setSheet('ready');
+    } catch { setBook(null); setSheet('error'); }
+  }, []);
+  // Build once per session. The record never changes after the game ends; only the upload state does.
+  const sid = s?.id ?? '';
+  useEffect(() => {
+    if (!sid || builtFor.current === sid) return;
+    builtFor.current = sid;
+    void build();
+  }, [sid, build]);
+
   async function download(kind: 'xlsx' | 'csv') {
     if (!s) return;
-    setBusy(kind); setMsg(null);
+    setMsg(null);
     try {
-      const f = kind === 'xlsx' ? await buildSessionXlsx(s, await allSessions()) : await buildEventsCsv(s);
+      let f: { name: string; blob: Blob };
+      if (kind === 'xlsx') {
+        if (!book) { setBusy('xlsx'); await build(); setBusy(null); setMsg('The sheet was not ready. Tap the button again.'); return; }
+        f = book;
+      } else { setBusy('csv'); f = await buildEventsCsv(s); }
       const how = await saveBlob(f.name, f.blob, { preferShare: isIos() });
       setMsg(how === 'shared' ? 'Choose "Save to Files" to keep the sheet.' : 'Saved to your downloads.');
-    } catch { setMsg('Could not build the file on this phone. Try again, or download it from the admin board.'); }
+    } catch { setMsg('Could not save the file on this phone. Try again, or download it from the admin board.'); }
     setBusy(null);
   }
   async function retry() { setBusy('sync'); await syncAll(); await refresh(); setBusy(null); }
@@ -68,12 +99,13 @@ export function Done({ id, load, onNew, onHistory }: { id: string; load: (id: st
 
   return (
     <main className="wrap">
-      <div className="topbar"><Brand small /></div>
+      <div className="topbar"><Brand small /><button type="button" className="back" onClick={onHome}>Home</button></div>
       <section className="result-hero">
         <svg className="deco" viewBox="0 0 150 150" aria-hidden="true"><path d="M75 14 L30 92 L75 108 Z" fill="#FF8A00" /><path d="M75 14 L120 92 L75 108 Z" fill="#E86400" /><path d="M75 14 L120 92 L75 108 L30 92 Z" fill="none" stroke="#F6F1E7" strokeWidth="6" strokeLinejoin="round" /></svg>
         <span className="eyebrow" style={{ color: 'inherit', opacity: 0.75 }}>{r.participantId} · {new Date(r.startedAt).toLocaleDateString()}</span>
         <h1>Session {r.sessionNo} {r.complete ? 'complete' : 'saved'}</h1>
         <div className="chips"><span className={'chip ' + status.cls} role="status">{status.t}</span><span className="chip plain">{r.complete ? 'All trials played' : 'Ended early'}</span></div>
+        {played && <p className="small">Played: {played}</p>}
       </section>
 
       {s.state === 'rejected' && <p className="notice bad" role="alert"><b>The server did not accept this session.</b> {s.lastError}. The data is safe on this phone, and you can still download it below.</p>}
@@ -98,9 +130,16 @@ export function Done({ id, load, onNew, onHistory }: { id: string; load: (id: st
       <section className="panel">
         <div className="file-card">
           <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="M6 2h8l5 5v15H6z" /><path d="M14 2v5h5M9 13h6M9 17h6" /></svg>
-          <div><div className="name">{fileName}</div><div className="small muted">Research data sheet, made automatically</div></div>
+          <div>
+            <div className="name">{book?.name ?? fileName}</div>
+            <div className="small muted" role="status" aria-live="polite">
+              {sheet === 'preparing' ? 'Building the research data sheet…'
+                : sheet === 'ready' && book ? `Research data sheet, made automatically · ${book.blob.size < 1024 * 1024 ? Math.max(1, Math.round(book.blob.size / 1024)) + ' KB' : (book.blob.size / 1048576).toFixed(1) + ' MB'}`
+                : <>Could not build the sheet on this phone. <button className="back" onClick={() => void build()} style={{ padding: 0, minHeight: 0, display: 'inline' }}>Try again</button></>}
+            </div>
+          </div>
         </div>
-        <button className="btn yellow block" onClick={() => download('xlsx')} disabled={!!busy}>{busy === 'xlsx' ? 'Preparing…' : isIos() ? 'Save or share the Excel sheet' : 'Download the Excel sheet'}</button>
+        <button className="btn yellow block" onClick={() => download('xlsx')} disabled={!!busy || sheet === 'preparing'}>{sheet === 'preparing' || busy === 'xlsx' ? 'Preparing…' : isIos() ? 'Save or share the Excel sheet' : 'Download the Excel sheet'}</button>
         <button className="btn sm block" onClick={() => download('csv')} disabled={!!busy}>Events as CSV</button>
         {msg && <p className="small" role="status">{msg}</p>}
         <details className="adv"><summary>What is in the sheet</summary>
@@ -112,7 +151,7 @@ export function Done({ id, load, onNew, onHistory }: { id: string; load: (id: st
         <button className="btn primary" onClick={() => onNew(r.participantId)}>Next session, same participant</button>
         <button className="btn" onClick={() => onNew()}>New participant</button>
       </div>
-      <button className="btn ghost" onClick={onHistory}>Sessions on this phone</button>
+      <div className="btn-row"><button className="btn ghost" onClick={onHistory}>Sessions on this phone</button><button className="btn ghost" onClick={onHome}>Home</button></div>
     </main>
   );
 }

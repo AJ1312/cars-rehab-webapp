@@ -1,6 +1,6 @@
 'use client';
 import { useCallback, useEffect, useState } from 'react';
-import { allSessions, deleteSession, getDevice, syncAll, type StoredSession } from '@/lib/client/local';
+import { allSessions, deleteSession, syncAll, type StoredSession } from '@/lib/client/local';
 
 export function History({ onBack, onOpen }: { onBack: () => void; onOpen: (id: string) => void }) {
   const [list, setList] = useState<StoredSession[] | null>(null);
@@ -11,8 +11,8 @@ export function History({ onBack, onOpen }: { onBack: () => void; onOpen: (id: s
 
   async function sync() {
     setBusy(true); setNote(null);
-    if (!getDevice()) setNote('This phone is not enrolled, so there is nowhere to upload to.');
-    else { const r = await syncAll(); setNote(r.revoked ? 'This phone was removed from the study.' : r.sent ? `${r.sent} uploaded.` : r.pending ? 'Nothing uploaded. Check the connection and try again.' : 'Everything is uploaded.'); }
+    const r = await syncAll();
+    setNote(r.revoked ? 'The study team removed this phone, so nothing uploads.' : r.sent ? `${r.sent} uploaded.` : r.pending ? 'Nothing uploaded. Check the connection and try again.' : 'Everything is uploaded.');
     await refresh(); setBusy(false);
   }
   async function clearUploaded() {

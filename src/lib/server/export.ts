@@ -2,7 +2,7 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 import core from '../core';
 import { kinSchema } from '../schema';
 import { getStore } from './store';
-import type { SessionFull } from './types';
+import type { SessionComment, SessionFull } from './types';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -22,25 +22,26 @@ export async function loadKin(id: string): Promise<any[][]> {
 }
 
 /** Shape the stored record the way core.js expects it. */
-export function asCoreSession(s: SessionFull, kin: any[][] = []): any {
-  return { ...s.record, id: s.id, kin };
+export function asCoreSession(s: SessionFull, kin: any[][] = [], comments: SessionComment[] = []): any {
+  return { ...s.record, id: s.id, kin, title: s.title ?? '', comments: comments.map((c) => ({ at: c.createdAt, author: c.author, text: c.body })) };
 }
 
 export async function sessionXlsx(s: SessionFull): Promise<{ name: string; bytes: Uint8Array }> {
   const store = getStore();
-  const [kin, history] = await Promise.all([loadKin(s.id), store.listSessions({ participant: s.participantCode })]);
+  const [kin, history, comments] = await Promise.all([loadKin(s.id), store.listSessions({ participant: s.participantCode }), store.listComments(s.id)]);
   const hist: any[] = [];
   for (const h of history) {
     if (h.id === s.id) continue;
     const full = await store.getSession(h.id);
     if (full) hist.push(asCoreSession(full));
   }
-  const cs = asCoreSession(s, kin);
+  const cs = asCoreSession(s, kin, comments);
   return { name: core.sessionFileName(cs, 'xlsx'), bytes: await core.buildXlsx(core.sessionWorkbookSpec(cs, hist)) };
 }
 
 export async function studyXlsx(rows: SessionFull[]): Promise<Uint8Array> {
-  return core.buildXlsx(core.studyWorkbookSpec(rows.map((r) => asCoreSession(r))));
+  const all = await getStore().commentsFor(rows.map((r) => r.id));
+  return core.buildXlsx(core.studyWorkbookSpec(rows.map((r) => asCoreSession(r, [], all.filter((c) => c.sessionId === r.id)))));
 }
 
 export async function loadFull(ids: string[]): Promise<SessionFull[]> {

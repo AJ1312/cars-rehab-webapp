@@ -24,7 +24,7 @@ export default async function Overview({ searchParams }: { searchParams: Promise
   const counts = Array.from({ length: weeks }, () => 0);
   for (const r of rows) { const w = Math.floor((now - +new Date(r.startedAt)) / (7 * DAY)); if (w >= 0 && w < weeks) counts[weeks - 1 - w]++; }
   const labels = counts.map((_, i) => (i === weeks - 1 ? 'now' : `-${weeks - 1 - i}w`));
-  const live = devices.filter((d) => d.enrolledAt && !d.revokedAt);
+  const live = devices.filter((d) => !d.revokedAt);
   const quiet = live.filter((d) => !d.lastSeenAt || now - +new Date(d.lastSeenAt) > 14 * DAY);
 
   return (
@@ -37,7 +37,7 @@ export default async function Overview({ searchParams }: { searchParams: Promise
         <div className="kpi"><b>{week.length}</b><span>Sessions, last 7 days</span></div>
         <div className="kpi"><b>{rows.length ? Math.round((100 * research) / rows.length) + '%' : '–'}</b><span>With AR position tracking</span></div>
         <div className={'kpi' + (serious.length ? ' bad' : '')}><b>{serious.length}</b><span>Need attention</span></div>
-        <div className={'kpi' + (quiet.length ? ' warn' : '')}><b>{live.length}</b><span>Phones enrolled{quiet.length ? ` · ${quiet.length} quiet` : ''}</span></div>
+        <div className={'kpi' + (quiet.length ? ' warn' : '')}><b>{live.length}</b><span>Active phones{quiet.length ? ` · ${quiet.length} quiet` : ''}</span></div>
       </div>
 
       <div className="cols">
@@ -59,7 +59,7 @@ export default async function Overview({ searchParams }: { searchParams: Promise
 
       <section className="panel">
         <h2>Latest sessions</h2>
-        {rows.length === 0 ? <div className="empty">No sessions yet. Enrol a phone under <Link className="lnk" href="/admin/devices">Phones</Link>, then run a session.</div> : (
+        {rows.length === 0 ? <div className="empty">No sessions yet. Run one on a phone with internet and it appears here. Phones are listed under <Link className="lnk" href="/admin/devices">Phones</Link>.</div> : (
           <div className="table-wrap"><table>
             <thead><tr><th>Participant</th><th className="r">#</th><th>Started</th><th>Mode</th><th>Phone</th><th>Checks</th></tr></thead>
             <tbody>{rows.slice(0, 10).map((r) => (

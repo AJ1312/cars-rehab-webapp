@@ -2,21 +2,23 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_SETTINGS, type Settings } from '../schema';
-import type { AuditEntry, Device, SessionFull, SessionQuery, SessionRow, Staff, Store } from './types';
+import type { AuditEntry, Device, SessionComment, SessionFull, SessionQuery, SessionRow, Staff, Store } from './types';
 
 /* Development / test store: one JSON file plus one file per movement recording.
    Not for production: Vercel's disk is read-only and not shared between instances. */
 
 interface Db {
   staff: Staff[];
-  devices: (Device & { tokenHash: string | null; codeHash: string | null })[];
+  devices: (Device & { tokenHash: string | null })[];
   sessions: (SessionFull & { kinRows: number })[];
   audit: AuditEntry[];
+  comments: SessionComment[];
+  deleted: { id: string; at: string }[];
   settings: Settings;
   auditSeq: number;
 }
 
-const EMPTY: Db = { staff: [], devices: [], sessions: [], audit: [], settings: DEFAULT_SETTINGS, auditSeq: 0 };
+const EMPTY: Db = { staff: [], devices: [], sessions: [], audit: [], comments: [], deleted: [], settings: DEFAULT_SETTINGS, auditSeq: 0 };
 
 export function createFileStore(dir: string): Store {
   const file = path.join(dir, 'db.json');
@@ -24,7 +26,7 @@ export function createFileStore(dir: string): Store {
   let chain: Promise<unknown> = Promise.resolve();
 
   async function load(): Promise<Db> {
-    try { return { ...EMPTY, ...JSON.parse(await fs.readFile(file, 'utf8')) }; } catch { return structuredClone(EMPTY); }
+    try { return { ...structuredClone(EMPTY), ...JSON.parse(await fs.readFile(file, 'utf8')) }; } catch { return structuredClone(EMPTY); }
   }
   async function save(db: Db) {
     await fs.mkdir(dir, { recursive: true });
@@ -39,9 +41,9 @@ export function createFileStore(dir: string): Store {
     chain = p.catch(() => undefined);
     return p;
   }
-  const strip = (d: Device & { tokenHash?: unknown; codeHash?: unknown }): Device => {
-    const { tokenHash, codeHash, ...rest } = d as Device & { tokenHash?: unknown; codeHash?: unknown };
-    void tokenHash; void codeHash;
+  const strip = (d: Device & { tokenHash?: unknown }): Device => {
+    const { tokenHash, ...rest } = d as Device & { tokenHash?: unknown };
+    void tokenHash;
     return rest;
   };
   const toRow = (s: SessionFull): SessionRow => { const { record, hasKin, ...row } = s; void record; void hasKin; return row; };
@@ -69,27 +71,46 @@ export function createFileStore(dir: string): Store {
     }),
     updateStaff: (id, patch) => tx((db) => { const s = db.staff.find((x) => x.id === id); if (s) Object.assign(s, patch); }),
 
-    createEnrolment: ({ label, codeHash, expiresAt, createdBy }) => tx((db) => {
-      void createdBy;
-      const d = { id: randomUUID(), label, model: null, createdAt: new Date().toISOString(), enrolledAt: null, lastSeenAt: null, revokedAt: null, pending: true, enrolExpiresAt: expiresAt, tokenHash: null, codeHash };
+    registerDevice: ({ label, tokenHash, model }) => tx((db) => {
+      const now = new Date().toISOString();
+      const d = { id: randomUUID(), label, model, createdAt: now, registeredAt: now, lastSeenAt: null, revokedAt: null, tokenHash };
       db.devices.push(d); return strip(d);
     }),
-    redeemEnrolment: (codeHash, tokenHash, model) => tx((db) => {
-      const d = db.devices.find((x) => x.codeHash === codeHash && x.pending && !x.revokedAt);
-      if (!d || !d.enrolExpiresAt || d.enrolExpiresAt < new Date().toISOString()) return null;
-      d.tokenHash = tokenHash; d.codeHash = null; d.pending = false; d.enrolledAt = new Date().toISOString(); d.model = model; d.enrolExpiresAt = null;
-      return strip(d);
-    }),
-    deviceByTokenHash: (hash) => tx((db) => { const d = db.devices.find((x) => x.tokenHash === hash && !x.revokedAt); return d ? strip(d) : null; }, false),
+    deviceByTokenHash: (hash) => tx((db) => { const d = db.devices.find((x) => x.tokenHash === hash); return d ? strip(d) : null; }, false),
     touchDevice: (id) => tx((db) => { const d = db.devices.find((x) => x.id === id); if (d) d.lastSeenAt = new Date().toISOString(); }),
     listDevices: () => tx((db) => db.devices.map(strip).sort((a, b) => b.createdAt.localeCompare(a.createdAt)), false),
-    revokeDevice: (id) => tx((db) => { const d = db.devices.find((x) => x.id === id); if (d) { d.revokedAt = new Date().toISOString(); d.tokenHash = null; d.codeHash = null; d.pending = false; } }),
+    revokeDevice: (id) => tx((db) => { const d = db.devices.find((x) => x.id === id); if (d && !d.revokedAt) d.revokedAt = new Date().toISOString(); }),
 
     upsertSession: (s) => tx((db) => {
       const i = db.sessions.findIndex((x) => x.id === s.id);
       if (i >= 0) { db.sessions[i] = { ...s, kinRows: db.sessions[i].kinRows || s.kinRows, hasKin: db.sessions[i].hasKin }; return { created: false }; }
       db.sessions.push(s); return { created: true };
     }),
+    updateSession: (id, p) => tx((db) => {
+      const s = db.sessions.find((x) => x.id === id); if (!s) return;
+      if (p.participantCode !== undefined) { s.participantCode = p.participantCode; s.record.participantId = p.participantCode; }
+      if (p.sessionNo !== undefined) { s.sessionNo = p.sessionNo; s.record.sessionNo = p.sessionNo; }
+      if (p.group !== undefined) { s.group = p.group; s.record.group = p.group; }
+      if (p.therapist !== undefined) { s.therapist = p.therapist || null; s.record.therapist = p.therapist; }
+      if (p.notes !== undefined) s.record.notes = p.notes;
+      if (p.title !== undefined) s.title = p.title;
+      if (p.flags !== undefined) s.flags = p.flags;
+    }),
+    deleteSession: async (id) => {
+      await tx((db) => {
+        db.sessions = db.sessions.filter((s) => s.id !== id);
+        db.comments = db.comments.filter((c) => c.sessionId !== id);
+        if (!db.deleted.some((d) => d.id === id)) db.deleted.push({ id, at: new Date().toISOString() });
+      });
+      await fs.rm(path.join(kinDir, id + '.json.gz'), { force: true });
+    },
+    wasDeleted: (id) => tx((db) => db.deleted.some((d) => d.id === id), false),
+    listComments: (sid) => tx((db) => db.comments.filter((c) => c.sessionId === sid).sort((a, b) => a.createdAt.localeCompare(b.createdAt)), false),
+    commentsFor: (ids) => tx((db) => { const set = new Set(ids); return db.comments.filter((c) => set.has(c.sessionId)).sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }, false),
+    commentCounts: () => tx((db) => { const m: Record<string, number> = {}; for (const c of db.comments) m[c.sessionId] = (m[c.sessionId] || 0) + 1; return m; }, false),
+    addComment: ({ sessionId, author, body }) => tx((db) => { const c: SessionComment = { id: randomUUID(), sessionId, author, body, createdAt: new Date().toISOString() }; db.comments.push(c); return c; }),
+    getComment: (id) => tx((db) => db.comments.find((c) => c.id === id) ?? null, false),
+    deleteComment: (id) => tx((db) => { db.comments = db.comments.filter((c) => c.id !== id); }),
     getSession: (id) => tx((db) => db.sessions.find((s) => s.id === id) ?? null, false),
     listSessions: (q) => tx((db) => {
       const list = filter(db, q);

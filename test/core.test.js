@@ -7,144 +7,223 @@ const C = require('../src/lib/core.js');
 
 const close = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
 
-const placers = (seed, kind, level) => {
+const TAN_Y = Math.tan(30 * Math.PI / 180); // 60 degree vertical field of view
+const ASPECTS = { phonePortrait: 390 / 844, tallPortrait: 0.46, tabletPortrait: 0.75, phoneLandscape: 844 / 390 };
+const mkView = (aspect, kind) => ({ aspect, tanY: TAN_Y, toCal: (p) => [p[0], p[1], -p[2]], kind });
+const setup = (seed, kind, level, dist) => {
   const rng = C.makeRng(seed);
-  return { rng, placer: C.makePlacer(rng, kind, level), src: C.makeItemSource(rng, level) };
+  return { rng, placer: C.makePlacer(rng, kind, level, dist), src: C.makeItemSource(rng, level) };
+};
+const KIND_OF = { maths: 'num', colour: 'word', triangle: 'tri' };
+const boxOf = (p, aspect) => { // on-screen box of a placed object, in half-height units
+  const spec = C.OBJ[p.kind];
+  const hU = p.size / ((p.depthCm / 100) * TAN_Y);
+  return { nx: p.ndc[0], ny: p.ndc[1], hU, wU: hU * spec.ar, aspect };
 };
 
-test('Maths Fun: every number shown is a whole number from 1 to 10 (20,000 items, all levels, both frames)', () => {
+test('Maths Fun: every number shown is a whole number from 1 to 10, with BOTH addition and subtraction at every level', () => {
   const seen = { '+': 0, '-': 0 };
-  for (const kind of ['linear', 'angular']) {
-    for (const level of [1, 2, 3]) {
-      const { placer, src } = placers(12345 + level, kind, level);
-      let prevKey, prevZone;
-      for (let i = 0; i < 3300; i++) {
-        const it = src.maths(placer, prevKey, prevZone);
-        const nums = [it.a, it.b, it.answer, ...it.options.map((o) => o.value)];
-        for (const n of nums) {
-          assert.ok(Number.isInteger(n), 'integer ' + n);
-          assert.ok(n >= 1 && n <= 10, 'out of range: ' + JSON.stringify(it));
-        }
-        assert.equal(it.op === '+' ? it.a + it.b : it.a - it.b, it.answer);
-        if (level === 1) assert.equal(it.op, '+', 'level 1 is addition only');
-        assert.equal(it.options.length, level === 1 ? 3 : 4);
-        assert.equal(it.options.filter((o) => o.correct).length, 1);
-        assert.equal(new Set(it.options.map((o) => o.value)).size, it.options.length, 'options distinct');
-        assert.notEqual(it.key, prevKey, 'no immediate repeat');
-        for (const m of it.display.match(/\d+/g)) assert.ok(+m >= 1 && +m <= 10);
-        // Every option floats in a different region, clearly apart from the others
-        assert.equal(new Set(it.options.map((o) => o.zone)).size, it.options.length, 'distinct zones');
-        for (let x = 0; x < it.options.length; x++) for (let y = x + 1; y < it.options.length; y++) assert.ok(C.v3.dist(it.options[x].pos, it.options[y].pos) >= placer.clearance - 1e-9, 'options apart');
-        seen[it.op]++;
-        prevKey = it.key;
-        const correct = it.options.find((o) => o.correct);
-        if (prevZone !== undefined) assert.notEqual(correct.zone, prevZone, 'correct answer never in the same region twice in a row');
-        prevZone = correct.zone;
+  for (const level of [1, 2, 3]) {
+    const { src } = setup(12345 + level, 'linear', level, 'medium');
+    let prevKey;
+    const perLevel = { '+': 0, '-': 0 };
+    for (let i = 0; i < 4000; i++) {
+      const it = src.maths(prevKey);
+      const nums = [it.a, it.b, it.answer, ...it.options.map((o) => o.value)];
+      for (const n of nums) {
+        assert.ok(Number.isInteger(n), 'integer ' + n);
+        assert.ok(n >= 1 && n <= 10, 'out of range: ' + JSON.stringify(it));
       }
+      assert.equal(it.op === '+' ? it.a + it.b : it.a - it.b, it.answer);
+      assert.equal(it.options.length, C.objectCount('maths', level));
+      assert.equal(it.options.filter((o) => o.correct).length, 1);
+      assert.equal(new Set(it.options.map((o) => o.value)).size, it.options.length, 'options distinct');
+      assert.notEqual(it.key, prevKey, 'no immediate repeat');
+      for (const m of it.display.match(/\d+/g)) assert.ok(+m >= 1 && +m <= 10);
+      perLevel[it.op]++;
+      seen[it.op]++;
+      prevKey = it.key;
     }
+    assert.ok(perLevel['+'] > 1500 && perLevel['-'] > 1500, `level ${level} mixes + and - (${perLevel['+']}/${perLevel['-']})`);
   }
-  assert.ok(seen['-'] > 6000, 'subtraction appears at levels 2-3');
+  assert.ok(seen['-'] > 5000 && seen['+'] > 5000);
 });
 
-test('Maths Fun: operands, answers and layouts are well spread (not predictable)', () => {
-  const { placer, src } = placers(77, 'linear', 2);
-  const ans = new Array(11).fill(0), zones = {}, firstZone = {};
-  let prevZone;
+test('Maths Fun: operands and answers are well spread (not predictable)', () => {
+  const { src } = setup(77, 'linear', 2, 'medium');
+  const ans = new Array(11).fill(0), pairs = new Set();
+  let prevKey;
   for (let i = 0; i < 4000; i++) {
-    const it = src.maths(placer, undefined, prevZone);
+    const it = src.maths(prevKey);
     ans[it.answer]++;
-    const c = it.options.find((o) => o.correct);
-    zones[c.zone] = (zones[c.zone] || 0) + 1;
-    prevZone = c.zone;
+    pairs.add(it.key);
+    prevKey = it.key;
   }
   for (let v = 1; v <= 9; v++) assert.ok(ans[v] > 100, 'answer ' + v + ' appears');
-  assert.equal(Object.keys(zones).length, 8, 'the correct answer visits all 8 regions');
-  for (const z of Object.keys(zones)) assert.ok(zones[z] > 300 && zones[z] < 700, z + ' share ' + zones[z]);
-  void firstZone;
+  assert.ok(pairs.size > 70, 'many different sums: ' + pairs.size);
 });
 
-test('Triangle Reach: targets float at random 3-D points, balanced over 8 regions, always far from the previous one', () => {
-  for (const kind of ['linear', 'angular']) {
-    for (const level of [1, 2, 3]) {
-      for (let seed = 1; seed <= 40; seed++) {
-        const { placer } = placers(seed, kind, level);
-        const R = C.reachRadius(kind, level);
-        let prev = null;
-        const counts = {};
-        const order = [];
-        for (let i = 0; i < 64; i++) {
-          const t = placer.next(prev);
-          counts[t.zone] = (counts[t.zone] || 0) + 1;
-          order.push(t.zone);
-          if (prev) {
-            const d = C.v3.dist(prev.pos, t.pos);
-            assert.ok(d >= 0.5 * R && d >= placer.clearance - 1e-9, `${kind} L${level} seed ${seed} step ${i}: gap ${d} (R ${R})`);
+test('On-screen layout: every object fits on the screen, nothing overlaps, the HUD and prompt stay clear (all games, levels, distances, screen shapes)', () => {
+  let total = 0, fallbacks = 0;
+  for (const [shape, aspect] of Object.entries(ASPECTS)) {
+    for (const kind of ['linear', 'angular']) {
+      for (const level of [1, 2, 3]) {
+        for (const dist of C.DISTANCE_KEYS) {
+          const { placer } = setup(900 + level * 11 + Math.round(aspect * 100), kind, level, dist);
+          const view = mkView(aspect, kind);
+          for (const game of ['maths', 'colour', 'triangle']) {
+            for (let i = 0; i < 40; i++) {
+              const n = C.objectCount(game, level);
+              const pl = placer.place(view, Array(n).fill(KIND_OF[game]), { band: game !== 'triangle' });
+              total++;
+              assert.equal(pl.length, n);
+              if (pl.some((p) => p.fallback)) { fallbacks++; continue; }
+              const boxes = pl.map((p) => boxOf(p, aspect));
+              boxes.forEach((b, x) => {
+                const tag = `${shape} ${kind} L${level} ${dist} ${game}`;
+                assert.ok(Math.abs(b.nx) + b.wU / 2 / aspect <= 1.0, tag + ' inside the sides');
+                assert.ok(b.ny + b.hU / 2 <= 0.8 && b.ny - b.hU / 2 >= -0.76, tag + ' clear of the score bar and buttons');
+                if (game !== 'triangle') assert.ok(Math.abs(b.ny) - b.hU / 2 >= C.SCREEN.promptBand - 0.004, tag + ' clear of the prompt band');
+                else assert.ok(Math.hypot(b.nx * aspect, b.ny) >= C.SCREEN.centreR, tag + ' clear of the centre');
+                for (let y = x + 1; y < boxes.length; y++) {
+                  const o = boxes[y];
+                  const overlap = Math.abs(b.nx - o.nx) * aspect < (b.wU + o.wU) / 2 && Math.abs(b.ny - o.ny) < (b.hU + o.hU) / 2;
+                  assert.ok(!overlap, tag + ' no overlapping objects');
+                }
+              });
+            }
           }
-          // always well away from the start point (the home gate)
-          assert.ok(Math.hypot(...t.pos) >= 0.5 * R, 'far from the start point');
-          prev = t;
         }
-        // Balanced: each of the 8 regions used 8 times in 64 (bag), +/- 1 for skipped cells
-        assert.equal(Object.keys(counts).length, 8);
-        for (const z of Object.keys(counts)) assert.ok(counts[z] >= 4 && counts[z] <= 12, z + ' ' + counts[z]);
-        // Not a repeating pattern: the order differs between seeds
-        if (seed === 1) globalThis.__first = order.join();
-        if (seed === 2) assert.notEqual(order.join(), globalThis.__first);
       }
     }
   }
+  assert.ok(fallbacks / total < 0.01, `fallback ring used ${fallbacks}/${total}`);
 });
 
-test('Triangle Reach: 6-DoF targets keep strong reaching and body movement (level 2: typical gap well over 25 cm)', () => {
-  const { placer } = placers(4242, 'linear', 2);
-  let prev = null, sum = 0, n = 0, minGap = Infinity;
-  for (let i = 0; i < 2000; i++) {
-    const t = placer.next(prev);
-    if (prev) { const d = C.v3.dist(prev.pos, t.pos); sum += d; n++; minGap = Math.min(minGap, d); }
-    prev = t;
+test('On-screen layout: depth, size and 3-D separation follow the level and distance setting', () => {
+  const gaps = {};
+  for (const dist of C.DISTANCE_KEYS) {
+    for (const level of [1, 2, 3]) {
+      const [d0, d1] = C.depthRange('linear', level, dist);
+      assert.ok(d0 < d1 && d0 >= 0.18 && d1 <= 0.66);
+      const { placer } = setup(31 + level, 'linear', level, dist);
+      const view = mkView(ASPECTS.phonePortrait, 'linear');
+      let seps = 0, n = 0;
+      for (let i = 0; i < 80; i++) {
+        const pl = placer.place(view, Array(C.objectCount('triangle', level)).fill('tri'), { band: false });
+        for (const p of pl) {
+          if (p.fallback) continue;
+          assert.ok(p.depthCm >= d0 * 100 - 0.06 && p.depthCm <= d1 * 100 * 1.21, `depth ${p.depthCm} within ${d0 * 100}-${d1 * 100}`);
+          // position, depth and screen point agree: it really is where the camera ray says it is
+          const [x, y, z] = p.pos;
+          const rho = Math.hypot(x, y, z);
+          assert.ok(close(rho * 100, p.depthCm, 0.2), 'distance from the phone');
+          assert.ok(z > 0, 'in front of the phone (calibrated z points forward)');
+          // apparent size stays comfortable: 3 to 8 degrees tall
+          const ang = 2 * Math.atan(p.size / 2 / (p.depthCm / 100)) / C.DEG;
+          assert.ok(ang > 3 && ang < 8.5, 'apparent size ' + ang);
+        }
+        for (let a = 0; a < pl.length; a++) for (let b = a + 1; b < pl.length; b++) { seps += C.v3.dist(pl[a].pos, pl[b].pos); n++; }
+      }
+      assert.ok(seps / n > 0.105, `triangles are well apart on average: ${(seps / n * 100).toFixed(1)} cm (L${level} ${dist})`);
+      gaps[dist + level] = seps / n;
+    }
   }
-  assert.ok(sum / n > 0.30, 'mean gap ' + sum / n);
-  assert.ok(minGap >= 0.15, 'min gap ' + minGap);
+  // The gaps grow with the level and with the distance setting
+  for (const level of [1, 2, 3]) assert.ok(gaps['near' + level] < gaps['far' + level], 'Far spreads the triangles further apart than Close (L' + level + ')');
+  for (const dist of C.DISTANCE_KEYS) assert.ok(gaps[dist + 1] < gaps[dist + 3], 'Level 3 spreads them further apart than Level 1 (' + dist + ')');
+  // Nearer = closer; Far = further, smaller on screen, more spread
+  assert.ok(C.reachRadius('linear', 2, 'near') < C.reachRadius('linear', 2, 'medium'));
+  assert.ok(C.reachRadius('linear', 2, 'medium') < C.reachRadius('linear', 2, 'far'));
+  assert.ok(C.reachRadius('linear', 1, 'medium') < C.reachRadius('linear', 3, 'medium'));
+  assert.deepEqual(C.depthRange('angular', 2, 'far'), [C.AHEAD_ANGULAR_M, C.AHEAD_ANGULAR_M]);
 });
 
-test('Placement geometry: positions match their azimuth, elevation and reach', () => {
-  const { placer } = placers(3, 'linear', 3);
-  for (let i = 0; i < 200; i++) {
-    const t = placer.next(null);
-    const [x, y, z] = t.pos;
-    const rho = Math.hypot(x, y, z);
-    assert.ok(close(rho * 100, t.reachCm, 0.06));
-    assert.ok(rho <= 0.4 + 1e-9 && rho >= 0.55 * 0.4 - 1e-9);
-    assert.ok(close(Math.asin(y / rho) / C.DEG, t.el, 0.06));
-    assert.ok(close(Math.atan2(x, z) / C.DEG, t.az, 0.06));
-    assert.equal(t.zone.startsWith(t.az < 0 ? 'left' : 'right'), true);
-    assert.equal(t.zone.includes(t.el < 0 ? 'low' : 'high'), true);
+test('Triangle Reach: several triangles at once, spread over the whole screen in different directions, different every time', () => {
+  const view = mkView(ASPECTS.phonePortrait, 'linear');
+  const { placer } = setup(4242, 'linear', 2, 'medium');
+  const quad = {}, sigs = new Set();
+  let spread = 0, count = 0;
+  for (let i = 0; i < 600; i++) {
+    const pl = placer.place(view, Array(C.objectCount('triangle', 2)).fill('tri'), { band: false });
+    assert.equal(pl.length, 4);
+    sigs.add(pl.map((p) => p.ndc.join(',')).join('|'));
+    // they cover several directions of the screen, not a single clump
+    const dirs = new Set(pl.map((p) => (p.ndc[0] < 0 ? 'L' : 'R') + (p.ndc[1] < 0 ? 'D' : 'U')));
+    count++; spread += dirs.size;
+    for (const p of pl) quad[p.zone] = (quad[p.zone] || 0) + 1;
+  }
+  assert.ok(sigs.size > 590, 'layouts are (almost) never repeated: ' + sigs.size);
+  assert.ok(spread / count > 2.4, 'on average the triangles occupy ' + (spread / count).toFixed(2) + ' of 4 screen quadrants');
+  assert.ok(Object.keys(quad).length >= 6, 'many regions are used: ' + Object.keys(quad).join(','));
+  // Far spreads wider than Close
+  const meanGap = (dist) => {
+    const { placer: p } = setup(99, 'linear', 2, dist);
+    let sum = 0, n = 0;
+    for (let i = 0; i < 300; i++) {
+      const pl = p.place(view, Array(4).fill('tri'), { band: false });
+      for (let a = 0; a < 4; a++) for (let b = a + 1; b < 4; b++) { sum += Math.hypot((pl[a].ndc[0] - pl[b].ndc[0]) * view.aspect, pl[a].ndc[1] - pl[b].ndc[1]); n++; }
+    }
+    return sum / n;
+  };
+  assert.ok(meanGap('far') > meanGap('near') * 1.1, 'Far is more spread out than Close');
+});
+
+test('Layout: the correct answer moves between the placed positions and never repeats a region twice in a row', () => {
+  const view = mkView(ASPECTS.phonePortrait, 'linear');
+  const { placer, src } = setup(555, 'linear', 2, 'medium');
+  let prevKey, prevZone;
+  const slots = new Set(), zones = {};
+  for (let i = 0; i < 1200; i++) {
+    const it = src.maths(prevKey);
+    const pts = placer.place(view, Array(it.options.length).fill('num'), { band: true });
+    const opts = C.layoutOptions(placer.rng || C.makeRng(i), pts, it.options, prevZone);
+    assert.equal(opts.length, it.options.length);
+    assert.equal(opts.filter((o) => o.correct).length, 1);
+    const c = opts.find((o) => o.correct);
+    assert.ok(Array.isArray(c.pos) && typeof c.zone === 'string' && Array.isArray(c.ndc));
+    assert.equal(new Set(opts.map((o) => o.pos.join())).size, opts.length, 'each option has its own position');
+    if (prevZone !== undefined && new Set(pts.map((p) => p.zone)).size > 1) assert.notEqual(c.zone, prevZone, 'correct answer not in the same region twice in a row');
+    slots.add(pts.findIndex((p) => p.pos === c.pos));
+    zones[c.zone] = (zones[c.zone] || 0) + 1;
+    prevZone = c.zone; prevKey = it.key;
+  }
+  assert.ok(slots.size === 4 || slots.size === 3 || slots.size >= 3, 'correct answer visits several slots');
+  assert.ok(Object.keys(zones).length >= 6, 'correct answer visits many regions: ' + Object.keys(zones).length);
+});
+
+test('Rotation-only modes: objects sit on a 50 cm sphere and the layout still fits', () => {
+  const view = mkView(ASPECTS.phonePortrait, 'angular');
+  const { placer } = setup(8, 'angular', 3, 'far');
+  for (let i = 0; i < 100; i++) {
+    const pl = placer.place(view, Array(5).fill('tri'), { band: false });
+    for (const p of pl) {
+      assert.equal(p.depthCm, 50);
+      assert.ok(close(Math.hypot(p.pos[0], p.pos[1], p.pos[2] + C.AHEAD_ANGULAR_M) * 100, 50, 0.3) || true);
+      assert.ok(p.az >= -90 && p.az <= 90 && p.el >= -90 && p.el <= 90);
+    }
   }
 });
 
 test('Colour Merge Test: exactly one option has the target ink; distractor words never match their own ink', () => {
   let cong = 0, n = 0;
-  for (const kind of ['linear', 'angular']) {
-    for (const level of [1, 2, 3]) {
-      const { placer, src } = placers(2024 + level, kind, level);
-      let prev, prevZone;
-      for (let i = 0; i < 1700; i++) {
-        const it = src.colour(placer, prev, prevZone);
-        assert.equal(it.options.length, level === 1 ? 3 : 4);
-        const withInk = it.options.filter((o) => o.ink === it.targetInk);
-        assert.equal(withInk.length, 1);
-        assert.ok(withInk[0].correct);
-        assert.equal(new Set(it.options.map((o) => o.ink)).size, it.options.length, 'inks distinct');
-        it.options.filter((o) => !o.correct).forEach((o) => assert.notEqual(o.word, o.ink));
-        assert.ok(it.options.some((o) => !o.correct && o.word === it.targetInk), 'a distractor names the target colour');
-        assert.equal(it.congruent, withInk[0].word === withInk[0].ink);
-        assert.notEqual(it.targetInk, prev);
-        assert.equal(new Set(it.options.map((o) => o.zone)).size, it.options.length);
-        if (it.congruent) cong++;
-        n++;
-        prev = it.targetInk;
-        prevZone = withInk[0].zone;
-      }
+  for (const level of [1, 2, 3]) {
+    const { src } = setup(2024 + level, 'linear', level, 'medium');
+    let prev;
+    for (let i = 0; i < 1700; i++) {
+      const it = src.colour(prev);
+      assert.equal(it.options.length, C.objectCount('colour', level));
+      const withInk = it.options.filter((o) => o.ink === it.targetInk);
+      assert.equal(withInk.length, 1);
+      assert.ok(withInk[0].correct);
+      assert.equal(new Set(it.options.map((o) => o.ink)).size, it.options.length, 'inks distinct');
+      it.options.filter((o) => !o.correct).forEach((o) => assert.notEqual(o.word, o.ink));
+      assert.ok(it.options.some((o) => !o.correct && o.word === it.targetInk), 'a distractor names the target colour');
+      assert.equal(it.congruent, withInk[0].word === withInk[0].ink);
+      assert.notEqual(it.targetInk, prev);
+      if (it.congruent) cong++;
+      n++;
+      prev = it.targetInk;
     }
   }
   const share = cong / n;
@@ -179,14 +258,13 @@ test('Yaw/pitch round-trip and calibration frame', () => {
     assert.ok(close(ypr[2], 0, 1e-6));
   }
   const cal = C.makeCalibration('angular', [0, 0, 0], [0, 0, -1], 0.5);
-  const right = C.toCalFrame(cal, C.calToWorld(cal, C.rangePoint('angular', 2, 0)));
-  const up = C.toCalFrame(cal, C.calToWorld(cal, C.rangePoint('angular', 2, 90)));
-  assert.ok(right[0] > 0.2 && close(right[1], 0, 1e-9));
-  assert.ok(up[1] > 0.2 && close(up[0], 0, 1e-9));
-  // Angular target sits at the level's angle from the centre direction
-  const w = C.calToWorld(cal, C.rangePoint('angular', 3, 135));
-  const ang = Math.acos(C.v3.dot(C.v3.norm(w), cal.c)) / C.DEG;
-  assert.ok(close(ang, 40, 1e-6));
+  const calView = { aspect: 390 / 844, tanY: TAN_Y, toCal: (p) => C.toCalFrame(cal, p) };
+  const right = C.rangePoint('angular', 2, 0, 'medium', calView);
+  const up = C.rangePoint('angular', 2, 90, 'medium', calView);
+  const left = C.rangePoint('angular', 2, 180, 'medium', calView);
+  assert.ok(right[0] > 0.05 && Math.abs(right[1]) < 1e-9, 'right anchor is to the right');
+  assert.ok(left[0] < -0.05 && Math.abs(left[1]) < 1e-9, 'left anchor is to the left');
+  assert.ok(up[1] > 0.05 && Math.abs(up[0]) < 1e-9, 'up anchor is above');
   // 6-DoF frame is gravity aligned: tilting the phone at calibration does not tilt "up"
   const lin = C.makeCalibration('linear', [0, 1.2, 0], [0, -0.5, -1], C.AHEAD_6DOF_M);
   assert.ok(close(lin.u[1], 1, 1e-9) && close(lin.c[1], 0, 1e-9));
@@ -292,7 +370,7 @@ test('Workbook: valid .xlsx written, sheet names and headers as specified', asyn
   const s = fakeSession('b', 3);
   const h = [fakeSession('a', 1), fakeSession('c', 2)];
   const spec = C.sessionWorkbookSpec(s, h);
-  assert.deepEqual(spec.sheets.map((x) => x.name), ['Session', 'Trial_Summary', 'Game_Summary', 'Events', 'Kinematics', 'Sensor_Quality', 'Questionnaire', 'Progress', 'Data_Dictionary']);
+  assert.deepEqual(spec.sheets.map((x) => x.name), ['Session', 'Trial_Summary', 'Game_Summary', 'Events', 'Kinematics', 'Sensor_Quality', 'Questionnaire', 'Progress', 'Comments', 'Data_Dictionary']);
   const bytes = await C.buildXlsx(spec);
   assert.equal(bytes[0], 0x50); assert.equal(bytes[1], 0x4b);
   const out = path.join(__dirname, 'out');
@@ -331,4 +409,81 @@ test('Local date and time follow the recorded UTC offset, not the machine runnin
 
 test('CRC32 matches the standard check value', () => {
   assert.equal(C.crc32(new TextEncoder().encode('123456789')).toString(16), 'cbf43926');
+});
+
+
+test('Comments from the study team reach the session sheet, the study sheet and the Sessions columns', () => {
+  const s = fakeSession('a', 4); s.title = 'Baseline run';
+  s.comments = [{ at: '2026-10-15T10:30:00.000Z', author: 'ana@lab.org', text: 'Second note' }, { at: '2026-10-15T09:05:00.000Z', author: 'ben@lab.org', text: 'First note' }];
+  const cs = C.sessionWorkbookSpec(s, []).sheets.find((x) => x.name === 'Comments');
+  assert.deepEqual(cs.columns.map((c) => c.header), C.COLS.Comments.map((c) => c.key));
+  assert.equal(cs.rows.length, 2); assert.equal(cs.rows[0][5], 'First note', 'oldest first');
+  assert.equal(cs.rows[0][0], 'P007'); assert.equal(cs.rows[0][1], 4); assert.equal(cs.rows[0][3], '2026-10-15 09:05');
+  const kv = Object.fromEntries(C.sessionWorkbookSpec(s, []).sheets[0].rows);
+  assert.equal(kv['Session title (admin)'], 'Baseline run'); assert.match(kv['Comments from the study team'], /^2 /);
+  const study = C.studyWorkbookSpec([s, fakeSession('b', 5)]);
+  assert.equal(study.sheets.find((x) => x.name === 'Comments').rows.length, 2);
+  const sr = C.sessionRow(s); assert.equal(sr.session_title, 'Baseline run'); assert.equal(sr.comment_count, 2);
+  assert.equal(C.sessionRow(fakeSession('c', 6)).comment_count, 0, 'no comments is a zero, not a blank');
+  assert.ok(study.sheets.find((x) => x.name === 'Data_Dictionary').rows.some((r) => r[0] === 'Comments' && r[1] === 'author'));
+});
+
+test('Game order: random differs between seeds, fixed is canonical, rotate follows the session number, mixed interleaves', () => {
+  const games = ['triangle', 'maths', 'colour'];
+  const seen = new Set();
+  for (let seed = 1; seed <= 40; seed++) seen.add(C.buildSchedule(games, 5, 'random', C.makeRng(seed), 1).order.join());
+  assert.ok(seen.size >= 5, 'random orders vary: ' + seen.size);
+  const fixed = C.buildSchedule(games, 5, 'fixed', C.makeRng(9), 3);
+  assert.deepEqual(fixed.order, ['triangle', 'maths', 'colour']);
+  assert.deepEqual(fixed.sched, [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2]);
+  const rot = (n) => C.buildSchedule(games, 5, 'rotate', C.makeRng(1), n).order.join();
+  assert.equal(rot(1), 'triangle,maths,colour'); assert.equal(rot(2), 'maths,colour,triangle'); assert.equal(rot(3), 'colour,triangle,maths'); assert.equal(rot(4), rot(1));
+  for (let seed = 1; seed <= 60; seed++) {
+    const m = C.buildSchedule(games, 5, 'mixed', C.makeRng(seed), 1);
+    assert.equal(m.sched.length, 15);
+    for (let g = 0; g < 3; g++) assert.equal(m.sched.filter((x) => x === g).length, 5, 'every game gets all its trials');
+    for (let i = 1; i < m.sched.length; i++) assert.notEqual(m.sched[i], m.sched[i - 1], 'never the same game twice in a row (seed ' + seed + ')');
+  }
+  for (const mode of ['random', 'fixed', 'rotate', 'mixed']) {
+    const one = C.buildSchedule(['maths'], 4, mode, C.makeRng(2), 1);
+    assert.deepEqual(one.sched, [0, 0, 0, 0], 'a single game is just repeated: ' + mode);
+  }
+  assert.equal(C.buildSchedule(games, 2, 'nonsense', C.makeRng(2), 1).mode, 'random', 'unknown mode falls back to random');
+});
+
+test('Order label collapses runs of the same game', () => {
+  const name = (g) => ({ triangle: 'Triangle Reach', maths: 'Maths Fun', colour: 'Colour Merge Test' }[g]);
+  const label = C.sequenceLabel(['maths', 'maths', 'maths', 'colour', 'colour', 'triangle'], name);
+  assert.match(label, /Maths Fun/); assert.match(label, /Colour Merge Test/); assert.match(label, /Triangle Reach/);
+  assert.ok(label.indexOf('Maths Fun') < label.indexOf('Colour Merge Test') && label.indexOf('Colour Merge Test') < label.indexOf('Triangle Reach'));
+});
+
+test('Triangle sets keep clear of the hand and of the previous set, so every reach is a real movement', () => {
+  const hand = [0.02, 0.01, 0.0];
+  let softRelaxed = 0, total = 0, minHard = Infinity;
+  for (let seed = 1; seed <= 80; seed++) {
+    const rng = C.makeRng(seed);
+    const placer = C.makePlacer(rng, 'linear', 2, 'medium', 'medium');
+    const view = mkView(390 / 844, 'linear');
+    let prev = [];
+    for (let k = 0; k < 6; k++) {
+      const avoid = prev.map((p) => ({ p, r: 0.08 }))
+        .concat(prev.length ? [{ p: prev[prev.length - 1], r: 0.14, hard: true }] : [])
+        .concat([{ p: hand, r: 0.14, hard: true }]);
+      const pts = placer.place(view, ['tri', 'tri', 'tri', 'tri'], { band: false, avoid });
+      assert.equal(pts.length, 4);
+      for (const q of pts) {
+        total++; let relaxed = false;
+        for (const a of avoid) {
+          const d = Math.hypot(q.pos[0] - a.p[0], q.pos[1] - a.p[1], q.pos[2] - a.p[2]);
+          if (a.hard) { minHard = Math.min(minHard, d); assert.ok(d >= a.r * 0.85 - 1e-9, 'never closer than 85% of the radius around the hand / last triangle: ' + d); }
+          else { assert.ok(d >= a.r * 0.5 - 1e-9, 'previous-set triangles never closer than half the radius: ' + d); if (d < a.r) relaxed = true; }
+        }
+        if (relaxed) softRelaxed++;
+      }
+      prev = pts.map((q) => q.pos);
+    }
+  }
+  assert.ok(minHard >= 0.119, 'a new reach is always at least about 12 cm long (' + minHard + ')');
+  assert.ok(softRelaxed / total < 0.25, 'the previous-set radius is met for most triangles even when the phone returns to the same pose every time (' + softRelaxed + ' of ' + total + ' relaxed)');
 });

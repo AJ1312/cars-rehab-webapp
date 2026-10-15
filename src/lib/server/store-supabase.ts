@@ -1,6 +1,6 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { DEFAULT_SETTINGS, settingsSchema, type Settings } from '../schema';
-import type { AuditEntry, Device, SessionFull, SessionQuery, SessionRow, Staff, Store } from './types';
+import type { AuditEntry, Device, SessionComment, SessionFull, SessionQuery, SessionRow, Staff, Store } from './types';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type R = Record<string, any>;
@@ -17,16 +17,16 @@ const toStaff = (r: R): Staff => ({
   active: r.active, createdAt: r.created_at, lastLoginAt: r.last_login_at
 });
 const toDevice = (r: R): Device => ({
-  id: r.id, label: r.label, model: r.model, createdAt: r.created_at, enrolledAt: r.enrolled_at, lastSeenAt: r.last_seen_at,
-  revokedAt: r.revoked_at, pending: !r.token_hash && !r.revoked_at && !!r.enrol_code_hash, enrolExpiresAt: r.enrol_expires_at
+  id: r.id, label: r.label, model: r.model, createdAt: r.created_at, registeredAt: r.enrolled_at, lastSeenAt: r.last_seen_at, revokedAt: r.revoked_at
 });
 const toRow = (r: R): SessionRow => ({
   id: r.id, participantCode: r.participant_code, sessionNo: r.session_no, startedAt: r.started_at, endedAt: r.ended_at,
   mode: r.mode, level: r.level, group: r.grp, therapist: r.therapist, complete: r.complete, calPass: r.cal_pass,
   calOverride: r.cal_override, deviceId: r.device_id, deviceLabel: r.device_label, flags: r.flags ?? [], summary: r.summary,
-  kinRows: r.kin_rows, receivedAt: r.received_at, appVersion: r.app_version
+  kinRows: r.kin_rows, receivedAt: r.received_at, appVersion: r.app_version, title: r.title ?? null
 });
-const LIST_COLS = 'id,participant_code,session_no,started_at,ended_at,mode,level,grp,therapist,complete,cal_pass,cal_override,device_id,device_label,flags,summary,kin_rows,received_at,app_version';
+const toComment = (r: R): SessionComment => ({ id: r.id, sessionId: r.session_id, author: r.author, body: r.body, createdAt: r.created_at });
+const LIST_COLS = 'id,participant_code,session_no,started_at,ended_at,mode,level,grp,therapist,complete,cal_pass,cal_override,device_id,device_label,flags,summary,kin_rows,received_at,app_version,title';
 
 export function createSupabaseStore(url: string, key: string): Store {
   const db: SupabaseClient = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
@@ -61,22 +61,15 @@ export function createSupabaseStore(url: string, key: string): Store {
       const { error } = await db.from('staff').update(m).eq('id', id); fail('updateStaff', error);
     },
 
-    async createEnrolment({ label, codeHash, expiresAt, createdBy }) {
-      const { data, error } = await db.from('devices').insert({ label, enrol_code_hash: codeHash, enrol_expires_at: expiresAt, created_by: createdBy }).select('*').single();
-      fail('createEnrolment', error); return toDevice(data);
+    async registerDevice({ label, tokenHash, model }) {
+      const now = new Date().toISOString();
+      const { data, error } = await db.from('devices').insert({ label, token_hash: tokenHash, model, enrolled_at: now }).select('*').single();
+      fail('registerDevice', error); return toDevice(data);
     },
-    async redeemEnrolment(codeHash, tokenHash, model) {
-      // Single statement with a guard so a code can only be redeemed once.
-      const { data, error } = await db.from('devices')
-        .update({ token_hash: tokenHash, enrol_code_hash: null, enrol_expires_at: null, enrolled_at: new Date().toISOString(), model })
-        .eq('enrol_code_hash', codeHash).is('revoked_at', null).is('token_hash', null).gt('enrol_expires_at', new Date().toISOString())
-        .select('*').maybeSingle();
-      fail('redeemEnrolment', error); return data ? toDevice(data) : null;
-    },
-    async deviceByTokenHash(hash) { const { data, error } = await db.from('devices').select('*').eq('token_hash', hash).is('revoked_at', null).maybeSingle(); fail('deviceByToken', error); return data ? toDevice(data) : null; },
+    async deviceByTokenHash(hash) { const { data, error } = await db.from('devices').select('*').eq('token_hash', hash).maybeSingle(); fail('deviceByToken', error); return data ? toDevice(data) : null; },
     async touchDevice(id) { await db.from('devices').update({ last_seen_at: new Date().toISOString() }).eq('id', id); },
     async listDevices() { const { data, error } = await db.from('devices').select('*').order('created_at', { ascending: false }); fail('listDevices', error); return (data ?? []).map(toDevice); },
-    async revokeDevice(id) { const { error } = await db.from('devices').update({ revoked_at: new Date().toISOString(), token_hash: null, enrol_code_hash: null }).eq('id', id); fail('revokeDevice', error); },
+    async revokeDevice(id) { const { error } = await db.from('devices').update({ revoked_at: new Date().toISOString() }).eq('id', id).is('revoked_at', null); fail('revokeDevice', error); },
 
     async upsertSession(s) {
       const { data: existing } = await db.from('sessions').select('id').eq('id', s.id).maybeSingle();
@@ -84,10 +77,47 @@ export function createSupabaseStore(url: string, key: string): Store {
         id: s.id, participant_code: s.participantCode, session_no: s.sessionNo, started_at: s.startedAt, ended_at: s.endedAt,
         mode: s.mode, level: s.level, grp: s.group, therapist: s.therapist, complete: s.complete, cal_pass: s.calPass,
         cal_override: s.calOverride, device_id: s.deviceId, device_label: s.deviceLabel, flags: s.flags, record: s.record,
-        summary: s.summary, app_version: s.appVersion
+        summary: s.summary, app_version: s.appVersion, title: s.title ?? null
       }, { onConflict: 'id' });
       fail('upsertSession', error); return { created: !existing };
     },
+    async updateSession(id, p) {
+      const { data: cur, error: e0 } = await db.from('sessions').select('record').eq('id', id).maybeSingle(); fail('updateSession read', e0);
+      if (!cur) return;
+      const rec = { ...cur.record }; const m: R = {};
+      if (p.participantCode !== undefined) { m.participant_code = p.participantCode; rec.participantId = p.participantCode; }
+      if (p.sessionNo !== undefined) { m.session_no = p.sessionNo; rec.sessionNo = p.sessionNo; }
+      if (p.group !== undefined) { m.grp = p.group; rec.group = p.group; }
+      if (p.therapist !== undefined) { m.therapist = p.therapist || null; rec.therapist = p.therapist; }
+      if (p.notes !== undefined) rec.notes = p.notes;
+      if (p.title !== undefined) m.title = p.title;
+      if (p.flags !== undefined) m.flags = p.flags;
+      m.record = rec;
+      const { error } = await db.from('sessions').update(m).eq('id', id); fail('updateSession', error);
+    },
+    async deleteSession(id) {
+      const { data } = await db.from('sessions').select('kin_path').eq('id', id).maybeSingle();
+      if (data?.kin_path) await db.storage.from(BUCKET).remove([data.kin_path]);
+      const { error } = await db.from('sessions').delete().eq('id', id); fail('deleteSession', error);   // comments go with it (on delete cascade)
+      await db.from('deleted_sessions').upsert({ id, at: new Date().toISOString() });
+    },
+    async wasDeleted(id) { const { data } = await db.from('deleted_sessions').select('id').eq('id', id).maybeSingle(); return !!data; },
+    async listComments(sid) { const { data, error } = await db.from('session_comments').select('*').eq('session_id', sid).order('created_at'); fail('listComments', error); return (data ?? []).map(toComment); },
+    async commentsFor(ids) {
+      const out: SessionComment[] = [];
+      for (let i = 0; i < ids.length; i += 150) {
+        const { data, error } = await db.from('session_comments').select('*').in('session_id', ids.slice(i, i + 150)).order('created_at'); fail('commentsFor', error);
+        out.push(...(data ?? []).map(toComment));
+      }
+      return out;
+    },
+    async commentCounts() {
+      const { data, error } = await db.from('session_comments').select('session_id'); fail('commentCounts', error);
+      const m: Record<string, number> = {}; for (const r of data ?? []) m[r.session_id] = (m[r.session_id] || 0) + 1; return m;
+    },
+    async addComment({ sessionId, author, body }) { const { data, error } = await db.from('session_comments').insert({ session_id: sessionId, author, body }).select('*').single(); fail('addComment', error); return toComment(data); },
+    async getComment(id) { const { data } = await db.from('session_comments').select('*').eq('id', id).maybeSingle(); return data ? toComment(data) : null; },
+    async deleteComment(id) { const { error } = await db.from('session_comments').delete().eq('id', id); fail('deleteComment', error); },
     async getSession(id) {
       const { data, error } = await db.from('sessions').select('*').eq('id', id).maybeSingle(); fail('getSession', error);
       if (!data) return null;

@@ -9,7 +9,7 @@ export default async function Settings() {
   const v = await getStore().getSettings();
   return (
     <>
-      <div><h1>Study settings</h1><p className="sub">Defaults for every enrolled phone.</p></div>
+      <div><h1>Study settings</h1><p className="sub">Defaults for every study phone.</p></div>
       <SettingsForm v={v} />
     </>
   );

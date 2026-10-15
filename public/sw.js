@@ -1,7 +1,7 @@
 /* CARS Rehab service worker: lets the play screen open and run with no signal.
    Only the play app shell and static files are cached. Admin pages and every /api call always go to the network. */
-const VERSION = 'cars-v2';
-const SHELL = ['/', '/enrol', '/icon.svg', '/manifest.webmanifest'];
+const VERSION = 'cars-v3';
+const SHELL = ['/', '/icon.svg', '/manifest.webmanifest'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -30,7 +30,7 @@ self.addEventListener('fetch', (e) => {
   // Pages: network first so updates arrive, cache when offline.
   if (req.mode === 'navigate') {
     e.respondWith(fetch(req).then((res) => {
-      if (res.ok && (url.pathname === '/' || url.pathname === '/enrol')) { const copy = res.clone(); caches.open(VERSION).then((c) => c.put(req, copy)); }
+      if (res.ok && url.pathname === '/') { const copy = res.clone(); caches.open(VERSION).then((c) => c.put(req, copy)); }
       return res;
     }).catch(async () => (await caches.match(req)) || (await caches.match('/')) || Response.error()));
     return;

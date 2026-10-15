@@ -16,6 +16,8 @@ export type ObjState = 'idle' | 'wrong' | 'correct' | 'disabled';
 export interface ViewObj {
   id: number; kind: ObjKind; pos: V3; label?: string; ink?: string; state: ObjState;
   progress: number; hot: boolean; touchR: number; bornMs: number; stateMs: number;
+  /** World height of the object in metres, and a cosmetic variant (colour / spin) so no two look alike. */
+  size: number; variant: number;
 }
 export interface ViewGate { pos: V3; r: number; yaw: number; active: boolean; progress: number; hint: boolean }
 export interface ViewCam { view: Float32Array; proj?: Float32Array | null; viewport?: [number, number, number, number] | null; pos: V3 }
@@ -27,7 +29,7 @@ export interface ViewFrame {
   gridY: number | null; tracking: 'ok' | 'lost' | 'waiting';
 }
 
-const FOV_Y = 60 * Math.PI / 180;
+export const FOV_Y = 60 * Math.PI / 180;
 const LIGHT: V3 = [0.35, 0.8, 0.5];
 
 /* ---------------- mesh data ---------------- */
@@ -108,6 +110,11 @@ void main(){
 const LINE_VS = `attribute vec3 aPos; uniform mat4 uProj; uniform mat4 uView; void main(){ gl_Position = uProj * uView * vec4(aPos, 1.0); }`;
 const LINE_FS = `precision mediump float; uniform vec4 uColor; void main(){ gl_FragColor = vec4(uColor.rgb * uColor.a, uColor.a); }`;
 
+// Cosmetic variety: no two objects on the screen look the same. Colour never means anything in the games
+// (the answer is never marked by colour), except the ink of the words in the Colour Merge Test.
+const TRI_COLORS = ['#FF8A00', '#FF5D8F', '#8E6BFF', '#1FC8A9', '#FFC400', '#4D9BFF'];
+const NUM_FILLS = ['#FFC400', '#7BE0B0', '#8EC5FF', '#FF9EC0', '#FFB27A', '#C9B3FF'];
+
 function hexRgb(h: string): V3 { const n = parseInt(h.slice(1), 16); return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]; }
 
 interface Particle { p: V3; v: V3; born: number; life: number; color: V3; size: number }
@@ -172,7 +179,7 @@ export class ArView {
     let aspect = 1;
     if (kind === 'num') {
       c.width = c.height = 256; const g = c.getContext('2d')!;
-      g.beginPath(); g.arc(128, 128, 112, 0, Math.PI * 2); g.fillStyle = PALETTE.yellow; g.fill(); g.lineWidth = 16; g.strokeStyle = PALETTE.ink; g.stroke();
+      g.beginPath(); g.arc(128, 128, 112, 0, Math.PI * 2); g.fillStyle = ink && ink !== '#fff' ? ink : PALETTE.yellow; g.fill(); g.lineWidth = 16; g.strokeStyle = PALETTE.ink; g.stroke();
       g.fillStyle = PALETTE.ink; g.font = `700 ${label.length > 1 ? 112 : 148}px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(label, 128, 138);
     } else if (kind === 'word') {
       c.width = 640; c.height = 224; aspect = 640 / 224; const g = c.getContext('2d')!;
@@ -255,12 +262,12 @@ export class ArView {
       if (o.kind !== 'tri') continue;
       const age = Math.max(0, now - o.bornMs);
       const pop = Math.min(1, age / 260); const ease = 1 - Math.pow(1 - pop, 3);
-      let s = 0.056 * ease * (1 + 0.14 * Math.sin(Math.min(1, age / 260) * Math.PI));
-      let alpha = 1; let col = hexRgb(o.state === 'wrong' ? PALETTE.coral : o.state === 'correct' ? PALETTE.green : o.state === 'disabled' ? '#8A8F9C' : PALETTE.orange);
+      let s = (o.size / 1.55) * ease * (1 + 0.14 * Math.sin(Math.min(1, age / 260) * Math.PI));
+      let alpha = 1; let col = hexRgb(o.state === 'wrong' ? PALETTE.coral : o.state === 'correct' ? PALETTE.green : o.state === 'disabled' ? '#8A8F9C' : TRI_COLORS[o.variant % TRI_COLORS.length]);
       if (o.hot && o.state === 'idle') s *= 1.12;
       if (o.state === 'correct') { const k = Math.min(1, (now - o.stateMs) / 380); s *= 1 + 0.5 * k; alpha = 1 - k; }
-      const bob = 0.008 * Math.sin(now / 520 + o.id * 1.7);
-      const yaw = now / 900 + o.id;
+      const bob = 0.1 * o.size * Math.sin(now / 520 + o.id * 1.7);
+      const yaw = (now / 900) * (0.6 + 0.12 * o.variant) + o.id;
       this.drawMesh(gl, this.pyramid, mat4.model([o.pos[0], o.pos[1] + bob, o.pos[2]], s, yaw), col, alpha, o.hot && o.state === 'idle' ? 0.22 : 0, 0.11);
     }
     const g = f.gate;
@@ -287,11 +294,12 @@ export class ArView {
       const pop = Math.min(1, age / 260); const ease = 1 - Math.pow(1 - pop, 3);
       const zoneCol: V3 = o.state === 'correct' ? hexRgb(PALETTE.green) : o.state === 'wrong' ? hexRgb(PALETTE.coral) : o.hot ? hexRgb(PALETTE.green) : [1, 1, 1];
       const zoneA = o.state === 'disabled' ? 0.12 : o.hot ? 0.95 : 0.42;
-      this.drawSprite(gl, this.label('zone', '', ''), o.pos, o.touchR * 2 * ease, o.touchR * 2 * ease, [zoneCol[0], zoneCol[1], zoneCol[2], zoneA * (o.state === 'correct' ? Math.max(0, 1 - (now - o.stateMs) / 500) : 1)]);
+      const ring = Math.min(o.touchR * 2, Math.max(0.05, o.size * 1.5)) * ease;
+      this.drawSprite(gl, this.label('zone', '', ''), o.pos, ring, ring, [zoneCol[0], zoneCol[1], zoneCol[2], zoneA * (o.state === 'correct' ? Math.max(0, 1 - (now - o.stateMs) / 500) : 1)]);
       if (o.kind === 'num' || o.kind === 'word' || o.kind === 'dot') {
-        const t = this.label(o.kind, o.label || '', o.ink || '#fff');
-        const h = (o.kind === 'word' ? 0.062 : o.kind === 'dot' ? 0.085 : 0.115) * ease * (o.hot && o.state === 'idle' ? 1.1 : 1) * (o.state === 'correct' ? 1 + 0.4 * Math.min(1, (now - o.stateMs) / 380) : 1);
-        const bob = 0.006 * Math.sin(now / 560 + o.id * 2.1);
+        const t = this.label(o.kind, o.label || '', o.kind === 'num' ? NUM_FILLS[o.variant % NUM_FILLS.length] : o.ink || '#fff');
+        const h = o.size * ease * (o.hot && o.state === 'idle' ? 1.1 : 1) * (o.state === 'correct' ? 1 + 0.4 * Math.min(1, (now - o.stateMs) / 380) : 1);
+        const bob = 0.06 * o.size * Math.sin(now / 560 + o.id * 2.1);
         const tint: [number, number, number, number] = o.state === 'disabled' ? [0.6, 0.6, 0.6, 0.35] : o.state === 'wrong' ? [1, 0.62, 0.58, 1] : o.state === 'correct' ? [0.7, 1, 0.8, Math.max(0, 1 - (now - o.stateMs) / 500)] : [1, 1, 1, 1];
         this.drawSprite(gl, t, [o.pos[0], o.pos[1] + bob, o.pos[2]], h * t.aspect, h, tint);
       }

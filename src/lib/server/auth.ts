@@ -61,9 +61,10 @@ export async function apiStaff(req: Request, min: Role = 'therapist', opts: { wr
 export async function deviceFromRequest(req: Request): Promise<Device | Response> {
   const h = req.headers.get('authorization') || '';
   const m = h.match(/^Bearer (cars_[A-Za-z0-9_-]{20,})$/);
-  if (!m) return fail(401, 'Device token required');
+  if (!m) return fail(401, 'Device token required', { code: 'unknown' });
   const d = await getStore().deviceByTokenHash(sha256(m[1]));
-  if (!d) return fail(401, 'This phone is not enrolled or was revoked');
+  if (!d) return fail(401, 'This phone is not known to the study', { code: 'unknown' });
+  if (d.revokedAt) return fail(401, 'This phone was removed from the study', { code: 'revoked' });
   void getStore().touchDevice(d.id);
   return d;
 }

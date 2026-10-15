@@ -3,7 +3,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { rmSync, mkdirSync } from 'node:fs';
-import { gzipSync, gunzipSync } from 'node:zlib';
+import { gzipSync, gunzipSync, inflateRawSync } from 'node:zlib';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
@@ -29,6 +29,16 @@ function payload(sessionNo = 1, overrides = {}) {
   return { ...rest, mode: '6dof', tzOffsetMin: 330, kinRows: kin.length, ...overrides, _kin: kin };
 }
 const clean = ({ _kin, ...p }) => p;
+/** Read every file of an .xlsx (zip with sizes in the local headers) as text, keyed by name. */
+function unzipText(buf) {
+  const out = {}; let o = 0;
+  while (o + 30 <= buf.length && buf.readUInt32LE(o) === 0x04034b50) {
+    const method = buf.readUInt16LE(o + 8), csize = buf.readUInt32LE(o + 18), nlen = buf.readUInt16LE(o + 26), xlen = buf.readUInt16LE(o + 28);
+    const name = buf.subarray(o + 30, o + 30 + nlen).toString(); const data = buf.subarray(o + 30 + nlen + xlen, o + 30 + nlen + xlen + csize);
+    out[name] = (method === 8 ? inflateRawSync(data) : data).toString('utf8'); o += 30 + nlen + xlen + csize;
+  }
+  return out;
+}
 
 before(async () => {
   rmSync(DATA, { recursive: true, force: true }); mkdirSync(DATA, { recursive: true });
@@ -57,7 +67,9 @@ test('nothing is readable without signing in', async () => {
     const { r } = await j(p); assert.equal(r.status, 307, p); assert.match(r.headers.get('location'), /\/admin\/login/);
   }
   assert.equal((await j('/api/sessions', { method: 'POST', body: '{}' })).status, 401);
-  assert.equal((await j('/api/config')).status, 401);
+  for (const p of ['/api/admin/devices/' + randomUUID(), '/api/admin/sessions/' + randomUUID(), '/api/admin/participants/P001']) assert.equal((await j(p, { method: 'DELETE' })).status, 401, p);
+  assert.equal((await j('/api/admin/sessions/' + randomUUID() + '/comments')).status, 401);
+  assert.equal((await j('/api/participants/P001/next')).status, 401, 'session numbers of participants need a registered phone');
 });
 
 test('login: wrong password fails, correct one sets a secure cookie, cross-site login is blocked', async () => {
@@ -78,22 +90,23 @@ test('admin pages render for a signed-in admin', async () => {
   }
 });
 
-test('enrol a phone: code works once, token works, forged token does not', async () => {
-  const mk = await j('/api/admin/devices', asAdmin({ method: 'POST', body: JSON.stringify({ label: 'Study phone 1' }) }));
-  assert.equal(mk.status, 200); assert.match(mk.body.code, /^[A-Z2-9]{4}-[A-Z2-9]{4}$/); assert.match(mk.body.url, /\/enrol\?code=/);
-  assert.equal((await j('/api/admin/devices', { method: 'POST', body: JSON.stringify({ label: 'x' }) })).status, 401);
-  const bad = await j('/api/enrol', { method: 'POST', body: JSON.stringify({ code: 'AAAA-BBBB' }) });
-  assert.equal(bad.status, 404);
-  const ok = await j('/api/enrol', { method: 'POST', body: JSON.stringify({ code: mk.body.code.toLowerCase(), model: 'Pixel test' }) });
-  assert.equal(ok.status, 200); assert.match(ok.body.token, /^cars_/); assert.equal(ok.body.label, 'Study phone 1');
-  token = ok.body.token; globalThis.__deviceId = mk.body.id;
-  assert.equal((await j('/api/enrol', { method: 'POST', body: JSON.stringify({ code: mk.body.code }) })).status, 404, 'a code is single-use');
+test('a phone registers itself: token works, forged token does not, no QR step exists', async () => {
+  const ok = await j('/api/device', { method: 'POST', headers: { 'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Version/17.4 Mobile/15E148 Safari/604.1' }, body: '{}' });
+  assert.equal(ok.status, 200); assert.match(ok.body.token, /^cars_/); assert.match(ok.body.label, /^iPhone · Safari · [0-9A-F]{4}$/);
+  assert.ok(ok.body.settings && ok.body.settings.trialsPerGame > 0, 'the study defaults come back with the token');
+  token = ok.body.token;
+  // the old QR enrolment endpoints are gone
+  assert.equal((await j('/api/enrol', { method: 'POST', body: JSON.stringify({ code: 'AAAA-BBBB' }) })).status, 404);
+  assert.equal((await j('/api/admin/devices', asAdmin({ method: 'POST', body: JSON.stringify({ label: 'x' }) }))).status, 404);
   assert.equal((await j('/api/config', asDevice())).status, 200);
-  assert.equal((await j('/api/config', { headers: { Authorization: 'Bearer cars_' + 'a'.repeat(43) } })).status, 401);
+  assert.equal((await j('/api/config')).status, 200, 'the study defaults are readable without registering');
+  const forged = { headers: { Authorization: 'Bearer cars_' + 'a'.repeat(43), 'Content-Type': 'application/json' }, method: 'POST', body: '{}' };
+  const f = await j('/api/sessions', forged);
+  assert.equal(f.status, 401); assert.equal(f.body.code, 'unknown');
 });
 
 test('upload: validates, is idempotent, recomputes summaries and flags', async () => {
-  const p = payload(1);
+  const p = payload(1); globalThis.__p1 = p;
   const first = await j('/api/sessions', asDevice({ method: 'POST', body: JSON.stringify(clean(p)) }));
   assert.equal(first.status, 200, JSON.stringify(first.body)); assert.equal(first.body.created, true); assert.equal(first.body.needKin, true);
   assert.ok(first.body.flags.includes('kin_missing'));
@@ -152,15 +165,78 @@ test('exports: a valid workbook with the 9 specified tabs, csv, and an audit tra
   const kin = await fetch(`${BASE}/api/export/session/${id}?format=kinematics.json`, { headers: { cookie } });
   assert.ok(Array.isArray(await kin.json()));
   const audit = await (await fetch(BASE + '/admin/audit', { headers: { cookie } })).text();
-  assert.match(audit, /export\.study/); assert.match(audit, /session\.uploaded/); assert.match(audit, /device\.enrolled/);
+  assert.match(audit, /export\.study/); assert.match(audit, /session\.uploaded/); assert.match(audit, /device\.registered/);
   await import('node:fs').then(async (fs) => fs.writeFileSync(new URL('./out/api_session.xlsx', import.meta.url), buf));
 });
 
-test('revoking a phone cuts it off immediately', async () => {
-  const d = await j('/api/admin/devices/' + globalThis.__deviceId, asAdmin({ method: 'DELETE' }));
+test('admin: comment on a session, correct and rename it, export with the comment, delete it for good', async () => {
+  const target = globalThis.__p1.id;
+  const sheetNames = (files) => [...files['xl/workbook.xml'].matchAll(/<sheet name="([^"]+)"/g)].map((m) => m[1]);
+  // comments: staff only, empty refused
+  assert.equal((await j(`/api/admin/sessions/${target}/comments`, { method: 'POST', body: JSON.stringify({ body: 'x' }) })).status, 401);
+  assert.equal((await j(`/api/admin/sessions/${target}/comments`, asAdmin({ method: 'POST', body: JSON.stringify({ body: '   ' }) }))).status, 422);
+  const c1 = await j(`/api/admin/sessions/${target}/comments`, asAdmin({ method: 'POST', body: JSON.stringify({ body: 'Phone slipped on the strap in trial 3.' }) }));
+  assert.equal(c1.status, 201);
+  const cl = await j(`/api/admin/sessions/${target}/comments`, asAdmin());
+  assert.equal(cl.body.comments.length, 1); assert.equal(cl.body.comments[0].author, ADMIN.email);
+
+  // correct and rename: title, group, notes; a clashing session number is refused
+  const ed = await j(`/api/admin/sessions/${target}`, asAdmin({ method: 'PATCH', body: JSON.stringify({ title: 'Baseline run', group: 'Control', notes: 'Checked by hand', sessionNo: 41 }) }));
+  assert.equal(ed.status, 200, JSON.stringify(ed.body));
+  const html = await (await fetch(`${BASE}/admin/sessions/${target}`, { headers: { cookie } })).text();
+  assert.match(html, /Baseline run/); assert.match(html, /Phone slipped on the strap/); assert.match(html, /Edit this session/);
+  assert.equal((await j(`/api/admin/sessions/${target}`, { method: 'PATCH', body: JSON.stringify({ title: 'no' }) })).status, 401);
+  const other = [...(await (await fetch(BASE + '/admin/sessions?participant=P007', { headers: { cookie } })).text()).matchAll(/\/admin\/sessions\/([0-9a-f-]{36})/g)].map((m) => m[1]).find((x) => x !== target);
+  assert.ok(other, 'a second P007 session exists');
+  const clash = await j(`/api/admin/sessions/${other}`, asAdmin({ method: 'PATCH', body: JSON.stringify({ sessionNo: 41 }) }));
+  assert.equal(clash.status, 422); assert.match(clash.body.error, /already has a session 41/);
+  assert.equal((await j(`/api/admin/sessions/${target}`, asAdmin({ method: 'PATCH', body: JSON.stringify({ participantCode: 'bad code!' }) }))).status, 422);
+
+  // the Excel sheet carries the edit and the comment
+  const xr = await fetch(`${BASE}/api/export/session/${target}`, { headers: { cookie } });
+  const files = unzipText(Buffer.from(await xr.arrayBuffer()));
+  assert.ok(sheetNames(files).includes('Comments'), sheetNames(files).join(','));
+  const all = Object.values(files).join('\n');
+  assert.match(all, /Phone slipped on the strap in trial 3\./); assert.match(all, /Baseline run/); assert.match(all, /Checked by hand/);
+  const csv = await (await fetch(`${BASE}/api/export/study?format=trials.csv&participant=P007&group=Control`, { headers: { cookie } })).text();
+  assert.match(csv, /Control/); assert.ok(csv.split('\r\n').length > 2, 'filters apply to the study export');
+  const studyFiles = unzipText(Buffer.from(await (await fetch(`${BASE}/api/export/study`, { headers: { cookie } })).arrayBuffer()));
+  assert.ok(sheetNames(studyFiles).includes('Comments'));
+
+  // delete a comment, then rename the participant everywhere
+  assert.equal((await j(`/api/admin/sessions/${target}/comments/${cl.body.comments[0].id}`, asAdmin({ method: 'DELETE' }))).status, 200);
+  assert.equal((await j(`/api/admin/sessions/${target}/comments`, asAdmin())).body.comments.length, 0);
+  const rn = await j('/api/admin/participants/P007', asAdmin({ method: 'PATCH', body: JSON.stringify({ to: 'p777' }) }));
+  assert.equal(rn.status, 200, JSON.stringify(rn.body));
+  assert.match(await (await fetch(BASE + '/admin/participants', { headers: { cookie } })).text(), /P777/);
+  assert.equal((await fetch(BASE + '/admin/participants/P007', { headers: { cookie } })).status, 404);
+  assert.equal((await j('/api/admin/participants/P777', asAdmin({ method: 'PATCH', body: JSON.stringify({ to: 'P777' }) }))).status, 200, 'renaming to the same code is a no-op');
+
+  // delete: needs a signed-in admin, removes it, and a phone retrying the upload does not bring it back
+  assert.equal((await j(`/api/admin/sessions/${target}`, { method: 'DELETE' })).status, 401);
+  assert.equal((await j(`/api/admin/sessions/${target}`, asAdmin({ method: 'DELETE' }))).status, 200);
+  assert.equal((await fetch(`${BASE}/admin/sessions/${target}`, { headers: { cookie } })).status, 404);
+  const retry = await j('/api/sessions', asDevice({ method: 'POST', body: JSON.stringify(clean(globalThis.__p1)) }));
+  assert.equal(retry.status, 200); assert.equal(retry.body.deleted, true);
+  assert.doesNotMatch(await (await fetch(BASE + '/admin/sessions?participant=P777', { headers: { cookie } })).text(), new RegExp(target));
+  const audit = await (await fetch(BASE + '/admin/audit', { headers: { cookie } })).text();
+  for (const a of ['comment.added', 'session.edited', 'participant.renamed', 'session.deleted']) assert.match(audit, new RegExp(a.replace('.', '\\.')));
+});
+
+test('removing a phone cuts it off immediately and says so', async () => {
+  const list = await fetch(BASE + '/admin/devices', { headers: { cookie } });
+  const html = await list.text();
+  assert.match(html, /iPhone · Safari/);
+  assert.doesNotMatch(html, /QR code|Enrol/i, 'the Phones page no longer offers enrolment');
+  const dev = (await j('/api/sessions', asDevice({ method: 'POST', body: JSON.stringify(clean(payload(3))) })));
+  assert.ok([200, 422].includes(dev.status), 'the phone can upload before it is removed');
+  const id = html.match(/name="id" value="([0-9a-f-]{36})"/)?.[1];
+  assert.ok(id, 'the Phones page lists the registered phone with a Remove button');
+  const d = await j('/api/admin/devices/' + id, asAdmin({ method: 'DELETE' }));
   assert.equal(d.status, 200);
-  assert.equal((await j('/api/config', asDevice())).status, 401);
-  assert.equal((await j('/api/sessions', asDevice({ method: 'POST', body: JSON.stringify(clean(payload(3))) }))).status, 401);
+  const cfg = await j('/api/config', asDevice()); assert.equal(cfg.status, 401); assert.equal(cfg.body.code, 'revoked');
+  const up = await j('/api/sessions', asDevice({ method: 'POST', body: JSON.stringify(clean(payload(3))) }));
+  assert.equal(up.status, 401); assert.equal(up.body.code, 'revoked');
 });
 
 test('lock-out after repeated wrong passwords, and sign-out clears access', async () => {

@@ -25,11 +25,34 @@
   };
   const GAME_ORDER = ['triangle', 'maths', 'colour'];
 
+  // The study protocol of Li et al. 2021: 10 h of rehabilitation over 5 days a week for 2 weeks, 1 h a day, of which
+  // 30 min is CARS: 15 trials of 2 min, 5 per game.
+  const PROTOCOL = { sessions: 10, perWeek: 5, weeks: 2, carsMinutes: 30, trialsPerGame: 5, trialSec: 120 };
+  // Adverse events the paper foresaw (shoulder or elbow pain, fatigue) plus the usual suspects with a screen in front of the eyes.
+  const ADVERSE_TAGS = [
+    { key: 'shoulder_pain', label: 'Shoulder pain' },
+    { key: 'elbow_pain', label: 'Elbow pain' },
+    { key: 'fatigue', label: 'Fatigue' },
+    { key: 'dizziness', label: 'Dizziness or nausea' },
+    { key: 'other', label: 'Something else' }
+  ];
+  const adverseLabel = (k) => (ADVERSE_TAGS.find((t) => t.key === k) || { label: k }).label;
+  /** "Maths Fun x5 > Triangle Reach x5": the order the trials were played in, runs collapsed. */
+  function sequenceLabel(seq, nameOf) {
+    const out = [];
+    (seq || []).forEach((g) => {
+      const last = out[out.length - 1];
+      if (last && last.g === g) last.n++; else out.push({ g, n: 1 });
+    });
+    return out.map((r) => nameOf(r.g) + (r.n > 1 ? ' x' + r.n : '')).join(' > ');
+  }
+
   // Reach distance per difficulty level: linear (6-DoF) and angular (motion / touch).
+  // Level = how far forward the participant has to reach at "Medium" distance (cm), and how many objects are on the screen.
   const LEVELS = {
-    1: { cm: 20, deg: 20 },
-    2: { cm: 30, deg: 30 },
-    3: { cm: 40, deg: 40 }
+    1: { cm: 25, deg: 20 },
+    2: { cm: 35, deg: 30 },
+    3: { cm: 45, deg: 40 }
   };
 
   const DIRS = [0, 45, 90, 135, 180, 225, 270, 315];
@@ -41,7 +64,7 @@
   // 6-DoF: the hand IS the phone. A target is touched when the phone comes within this distance of its centre.
   const TOUCH_RADIUS_LINEAR_M = 0.07;
   // Angular (iPhone Safari, practice): the aim point on a 50 cm sphere must come within this distance of the target.
-  const TARGET_RADIUS_M = 0.065;
+  const TARGET_RADIUS_M = 0.055;
   const HOME_RADIUS_M = 0.05; // start-gate zone around the centre point
   const AHEAD_ANGULAR_M = 0.5; // angular modes: targets sit on a sphere 50 cm from the phone
   const AHEAD_6DOF_M = 0; // 6-DoF: the tracked point is the phone itself
@@ -50,7 +73,8 @@
     { key: 'red', name: 'RED', hex: '#FF4B3E' },
     { key: 'blue', name: 'BLUE', hex: '#4D9BFF' },
     { key: 'green', name: 'GREEN', hex: '#2FD06A' },
-    { key: 'yellow', name: 'YELLOW', hex: '#FFD43B' }
+    { key: 'yellow', name: 'YELLOW', hex: '#FFD43B' },
+    { key: 'purple', name: 'PURPLE', hex: '#B58CFF' }
   ];
 
   const CAL_RULES = {
@@ -226,118 +250,197 @@
   /* ------------------------------------------------------------------ */
 
   // ---------------------------------------------------------------------------------------------
-  // Random placement in 3-D. Targets float at random points in the reach envelope around the start
-  // point (left / right, low / high, near / far), as objects float around the player in the AR scene.
-  // A shuffled bag of the eight cells guarantees every region is used equally often, in an order the
-  // participant cannot predict, with random position inside each cell. Consecutive targets are always
-  // far apart so that every reach is a real movement.
+  // Placement. Every object is put where the participant can SEE it: a point on the screen (x, y in
+  // -1..1) plus a distance along that pixel's ray. The score bar, the tool buttons and the prompt in the
+  // middle are kept clear, objects never overlap, and the touch zones of two objects never overlap
+  // either, so everything fits on the screen at once. The distance is the physical reach in position
+  // tracking (the phone has to travel that far) and the apparent size stays comfortable at any distance.
   // ---------------------------------------------------------------------------------------------
-  const CELLS = [];
-  ['L', 'R'].forEach((side) => ['low', 'high'].forEach((band) => ['near', 'far'].forEach((reach) => {
-    CELLS.push({ side, band, reach, key: (side === 'L' ? 'left' : 'right') + '-' + band + '-' + reach });
-  })));
+  // "How close do you want it?": nearer = objects closer to the phone and packed towards the middle,
+  // far = objects further away, smaller and spread over the whole screen.
+  const DISTANCES = {
+    near: { key: 'near', label: 'Close', depthF: 0.8, spread: 0.74, size: 1.06, gap: 0.05 },
+    medium: { key: 'medium', label: 'Medium', depthF: 1.0, spread: 0.86, size: 1.0, gap: 0.08 },
+    far: { key: 'far', label: 'Far', depthF: 1.25, spread: 1.0, size: 0.9, gap: 0.11 }
+  };
+  const DISTANCE_KEYS = ['near', 'medium', 'far'];
+  // Size of the triangles, numbers and words (a multiplier on their apparent size).
+  const OBJECT_SIZES = { small: { key: 'small', label: 'Small', k: 0.8 }, medium: { key: 'medium', label: 'Medium', k: 1 }, large: { key: 'large', label: 'Large', k: 1.25 } };
+  const SIZE_KEYS = ['small', 'medium', 'large'];
+  // Apparent height in degrees (of the view) and width / height of each kind of object.
+  const OBJ = {
+    tri: { deg: 7.2, ar: 1.15 },
+    num: { deg: 7.6, ar: 1 },
+    word: { deg: 5.4, ar: 2.86 },
+    dot: { deg: 8, ar: 1 }
+  };
+  // Parts of the screen that must stay clear (normalised device coordinates).
+  const SCREEN = { top: 0.77, bottom: -0.73, side: 0.88, promptBand: 0.13, centreR: 0.14 };
+  const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 
-  // Reach radius used for spacing rules: linear cm, or the chord on the 50 cm sphere for angular modes.
-  function reachRadius(kind, level) {
-    const lv = LEVELS[level] || LEVELS[2];
-    return kind === 'angular' ? AHEAD_ANGULAR_M * Math.sin(lv.deg * DEG) : lv.cm / 100;
+  // How many objects are on the screen at once, per difficulty level.
+  function objectCount(game, level) {
+    const L = clamp(level | 0, 1, 3);
+    if (game === 'colour') return [3, 4, 4][L - 1];
+    return [3, 4, 5][L - 1];
   }
 
-  // spec: azimuth (deg, + right of forward), elevation (deg, + up), f = reach as a fraction of the level radius.
-  function specToPos(kind, level, spec) {
-    const lv = LEVELS[level] || LEVELS[2];
-    const az = spec.az * DEG, el = spec.el * DEG;
-    const dx = Math.sin(az) * Math.cos(el), dy = Math.sin(el), dz = Math.cos(az) * Math.cos(el);
-    if (kind === 'angular') {
-      const alpha = spec.f * lv.deg * DEG;
-      const n = Math.hypot(dx, dy) || 1;
-      return [AHEAD_ANGULAR_M * Math.sin(alpha) * dx / n, AHEAD_ANGULAR_M * Math.sin(alpha) * dy / n, AHEAD_ANGULAR_M * (Math.cos(alpha) - 1)];
+  // Distance range (m) from the phone to the objects. Position tracking only: in rotation modes every object sits on a 50 cm sphere.
+  function depthRange(kind, level, dist) {
+    if (kind === 'angular') return [AHEAD_ANGULAR_M, AHEAD_ANGULAR_M];
+    const mid = ((LEVELS[level] || LEVELS[2]).cm / 100) * (DISTANCES[dist] || DISTANCES.medium).depthF;
+    return [clamp(mid * 0.75, 0.18, 0.6), clamp(mid * 1.3, 0.27, 0.66)];
+  }
+
+  function reachRadius(kind, level, dist) {
+    const [a, b] = depthRange(kind, level, dist || 'medium');
+    return (a + b) / 2;
+  }
+
+  // Camera-space point (x right, y up, -z forward) for a screen point and a distance along its ray.
+  function rayPoint(view, nx, ny, d) {
+    const dir = v3.norm([nx * view.tanY * view.aspect, ny * view.tanY, -1]);
+    return v3.scale(dir, d);
+  }
+
+  const overlapGap = (a, b, gap) => {
+    // both in half-height units: do the two boxes (plus a gap) overlap?
+    return Math.abs(a.nx - b.nx) * a.aspect < (a.wU + b.wU) / 2 + gap && Math.abs(a.ny - b.ny) < (a.hU + b.hU) / 2 + gap;
+  };
+
+  /**
+   * Choose where `kinds.length` objects go. view = { aspect (width / height), tanY (tan of half the vertical field of view) }.
+   * Returns objects { kind, nx, ny, d, pc (camera space), size (world height, m), wU, hU }.
+   */
+  function layoutOnScreen(rng, kind, level, dist, view, kinds, opts) {
+    opts = opts || {};
+    const P = DISTANCES[dist] || DISTANCES.medium;
+    const [d0, d1] = depthRange(kind, level, dist);
+    const linear = kind === 'linear';
+    const aspect = view.aspect, tanY = view.tanY;
+    const n = kinds.length;
+    // Touch zones may touch a little but not sit on top of each other (the nearest object wins a touch anyway).
+    const minSep3D = linear ? 1.45 * TOUCH_RADIUS_LINEAR_M : 0;
+    const score = (objs) => {
+      let m = Infinity;
+      for (let i = 0; i < objs.length; i++) for (let j = i + 1; j < objs.length; j++) {
+        const a = objs[i], b = objs[j];
+        const sx = (Math.abs(a.nx - b.nx) * aspect) / ((a.wU + b.wU) / 2 + P.gap);
+        const sy = Math.abs(a.ny - b.ny) / ((a.hU + b.hU) / 2 + P.gap);
+        m = Math.min(m, Math.max(sx, sy));
+      }
+      return m;
+    };
+    for (let round = 0; round < 10; round++) {
+      // Nothing fits? Make everything a little smaller (and a little further away) and try again.
+      const grow = linear ? 1 + 0.04 * Math.min(round, 5) : 1;
+      const shrink = Math.max(0.55, 1 - 0.06 * round);
+      const found = [];
+      for (let attempt = 0; attempt < 30 && found.length < 3; attempt++) {
+        const objs = [];
+        let ok = true;
+        for (let i = 0; i < n && ok; i++) {
+          const spec = OBJ[kinds[i]] || OBJ.num;
+          let placed = null;
+          for (let tries = 0; tries < 30 && !placed; tries++) {
+            const d = linear ? (d0 + rng.next() * (d1 - d0)) * grow : AHEAD_ANGULAR_M;
+            const hAng = spec.deg * P.size * (opts.sizeK || 1) * shrink * (0.94 + 0.12 * rng.next());
+            const size = 2 * d * Math.tan((hAng * DEG) / 2);
+            const hU = size / (d * tanY), wU = hU * spec.ar;
+            const halfX = wU / 2 / aspect, halfY = hU / 2;
+            const xHi = Math.max(0.1, SCREEN.side - halfX) * P.spread;
+            const yHi = Math.max(0.12, SCREEN.top - halfY) * P.spread, yLo = -Math.max(0.12, -SCREEN.bottom - halfY) * P.spread;
+            const nx = (rng.next() * 2 - 1) * xHi;
+            const ny = yLo + rng.next() * (yHi - yLo);
+            if (opts.band ? Math.abs(ny) - halfY < SCREEN.promptBand : Math.hypot(nx * aspect, ny) < SCREEN.centreR + Math.max(wU, hU) / 2) continue;
+            const pc = rayPoint(view, nx, ny, d);
+            // Keep clear of places the participant has just been (the hand and the previous set), so every new reach is a real movement.
+            if (opts.avoid && opts.avoid.length && view.toCal) {
+              // "hard" entries (where the hand is now / was last) are relaxed only a little; the rest (the previous set) give way first.
+              const cp = view.toCal(pc), soft = Math.max(0.5, 1 - 0.08 * round), hard = Math.max(0.85, 1 - 0.02 * round);
+              if (opts.avoid.some((a) => v3.dist(cp, a.p) < a.r * (a.hard ? hard : soft))) continue;
+            }
+            const cand = { kind: kinds[i], nx, ny, d, pc, size, wU, hU, aspect };
+            let clash = false;
+            for (const o of objs) {
+              if (overlapGap(cand, o, P.gap) || (round < 6 && minSep3D && v3.dist(pc, o.pc) < minSep3D)) { clash = true; break; }
+            }
+            if (!clash) placed = cand;
+          }
+          if (!placed) ok = false; else objs.push(placed);
+        }
+        if (ok) found.push(objs);
+      }
+      if (found.length) {
+        // Three random valid layouts; keep the best spread one (still random, but never a lumpy cluster).
+        let best = found[0], bs = score(found[0]);
+        for (const f of found) { const s = score(f); if (s > bs) { best = f; bs = s; } }
+        best.forEach((o) => { delete o.aspect; });
+        return best;
+      }
     }
-    const rho = (spec.f * lv.cm) / 100;
-    return [rho * dx, rho * dy, rho * dz];
+    // Last resort (tiny or odd screens): spread them on a ring around the middle.
+    const spec0 = OBJ[kinds[0]] || OBJ.num;
+    const d = linear ? (d0 + d1) / 2 * 1.4 : AHEAD_ANGULAR_M;
+    const phase = rng.next() * Math.PI * 2;
+    return kinds.map((k, i) => {
+      const a = phase + (i * 2 * Math.PI) / n;
+      const nx = 0.55 * Math.cos(a), ny = clamp(0.5 * Math.sin(a), SCREEN.bottom + 0.1, SCREEN.top - 0.1);
+      const size = 2 * d * Math.tan((spec0.deg * 0.6 * DEG) / 2);
+      const hU = size / (d * tanY);
+      return { kind: k, nx, ny, d, pc: rayPoint(view, nx, ny, d), size, wU: hU * (OBJ[k] || OBJ.num).ar, hU, fallback: true };
+    });
   }
 
-  // Fixed anchor points for the range-of-motion check: right, up, left, down at the full level radius.
-  function rangePoint(kind, level, dirDeg) {
-    const lv = LEVELS[level] || LEVELS[2];
-    const ph = dirDeg * DEG;
-    if (kind === 'angular') {
-      const a = lv.deg * DEG;
-      return [AHEAD_ANGULAR_M * Math.sin(a) * Math.cos(ph), AHEAD_ANGULAR_M * Math.sin(a) * Math.sin(ph), AHEAD_ANGULAR_M * (Math.cos(a) - 1)];
-    }
-    const r = lv.cm / 100;
-    return [r * Math.cos(ph), r * Math.sin(ph), 0];
+  // Name the region of the screen / depth an object is in (for the data sheet).
+  function zoneOf(kind, level, dist, o, aspect) {
+    const side = o.nx < 0 ? 'left' : 'right';
+    const band = o.ny < 0 ? 'low' : 'high';
+    let reach;
+    if (kind === 'linear') { const [a, b] = depthRange(kind, level, dist); reach = o.d < (a + b) / 2 ? 'near' : 'far'; }
+    else reach = Math.hypot(o.nx * aspect, o.ny) < 0.55 ? 'near' : 'far';
+    return `${side}-${band}-${reach}`;
   }
 
-  function placement(kind, level, cell, az, el, f) {
-    const pos = specToPos(kind, level, { az, el, f });
+  // Fixed anchor points for the range-of-motion check: right, up, left, down, as seen from the calibration pose.
+  const RANGE_NDC = { 0: [0.74, 0], 90: [0, 0.6], 180: [-0.74, 0], 270: [0, -0.56] };
+  function rangePoint(kind, level, dirDeg, dist, view) {
+    const nd = RANGE_NDC[dirDeg] || RANGE_NDC[0];
+    const d = kind === 'linear' ? reachRadius(kind, level, dist) : AHEAD_ANGULAR_M;
+    const pc = rayPoint(view, nd[0], nd[1], d);
+    return view.toCal(pc);
+  }
+
+  function placement(kind, level, dist, o, view) {
+    const pos = view.toCal(o.pc);
+    const ahead = kind === 'angular' ? AHEAD_ANGULAR_M : 0;
+    const dx = pos[0], dy = pos[1], dz = pos[2] + ahead;
     return {
-      pos, az: round(az, 1), el: round(el, 1), zone: cell.key,
-      reachCm: round(Math.hypot(pos[0], pos[1], pos[2]) * 100, 1)
+      pos, az: round(Math.atan2(dx, dz) / DEG, 1), el: round(Math.atan2(dy, Math.hypot(dx, dz)) / DEG, 1),
+      zone: zoneOf(kind, level, dist, o, view.aspect), reachCm: round(Math.hypot(pos[0], pos[1], pos[2]) * 100, 1),
+      depthCm: round(o.d * 100, 1), size: o.size, ndc: [round(o.nx, 3), round(o.ny, 3)], kind: o.kind, fallback: !!o.fallback
     };
   }
 
-  function makePlacer(rng, kind, level) {
-    let bag = [];
-    let last = null;
-    const R = reachRadius(kind, level);
-    // Two targets must be clearly separate: never closer than the two touch zones plus a margin.
-    const clearance = (kind === 'angular' ? 2 * TARGET_RADIUS_M : 2 * TOUCH_RADIUS_LINEAR_M) + 0.025;
-    function refill() {
-      bag = rng.shuffle(CELLS);
-      if (last && bag[0].key === last) bag.push(bag.shift());
-    }
-    function sampleIn(cell) {
-      const az = (cell.side === 'L' ? -1 : 1) * (10 + rng.next() * 80);
-      const el = cell.band === 'low' ? -(5 + rng.next() * 45) : 5 + rng.next() * 55;
-      const f = cell.reach === 'near' ? 0.72 + rng.next() * 0.13 : 0.85 + rng.next() * 0.15;
-      return placement(kind, level, cell, az, el, f);
-    }
+  function makePlacer(rng, kind, level, dist, size) {
+    const dd = DISTANCE_KEYS.includes(dist) ? dist : 'medium';
+    const sizeK = (OBJECT_SIZES[size] || OBJECT_SIZES.medium).k;
     return {
-      kind, level, R, clearance,
-      // One target, far from `prev` (its previous position) so the arm has to travel.
-      next(prev) {
-        for (const strict of [1.0, 0.75, 0.5, 0]) {
-          const need = Math.max(strict * R, strict ? clearance : 0);
-          for (let guard = 0; guard < 8; guard++) {
-            if (!bag.length) refill();
-            // try the cells still in the bag in order, keeping the bag fair if a cell is skipped
-            for (let i = 0; i < bag.length; i++) {
-              for (let k = 0; k < 6; k++) {
-                const cand = sampleIn(bag[i]);
-                if (!prev || v3.dist(cand.pos, prev.pos) >= need) {
-                  const cell = bag.splice(i, 1)[0];
-                  last = cell.key;
-                  return cand;
-                }
-              }
-            }
-            refill();
-          }
-        }
-        const c = sampleIn(rng.pick(CELLS)); last = c.zone; return c;
-      },
-      // n option positions, all in different regions and clearly apart from each other.
-      many(n, avoidZone) {
-        for (let attempt = 0; attempt < 400; attempt++) {
-          const cells = rng.shuffle(CELLS).slice(0, n);
-          const pts = cells.map(sampleIn);
-          let ok = true;
-          for (let i = 0; i < n && ok; i++) for (let j = i + 1; j < n; j++) if (v3.dist(pts[i].pos, pts[j].pos) < Math.max(clearance, 0.62 * R)) { ok = false; break; }
-          if (ok) { void avoidZone; return pts; }
-        }
-        // Very small reach envelope: accept the best spread found.
-        const cells = rng.shuffle(CELLS).slice(0, n);
-        return cells.map(sampleIn);
+      kind, level, dist: dd,
+      R: reachRadius(kind, level, dd),
+      // Minimum distance between two objects' centres (position tracking).
+      clearance: kind === 'linear' ? 1.45 * TOUCH_RADIUS_LINEAR_M : 0,
+      // Place `kinds.length` objects on the screen described by `view` ({ aspect, tanY, toCal }).
+      place(view, kinds, opts) {
+        return layoutOnScreen(rng, kind, level, dd, view, kinds, Object.assign({ sizeK }, opts || {})).map((o) => placement(kind, level, dd, o, view));
       }
     };
   }
 
   // Put the correct answer in a random one of the placed positions, never the same zone twice in a row.
-  function layoutOptions(rng, placer, options, avoidZone) {
-    const pts = placer.many(options.length, avoidZone);
+  function layoutOptions(rng, pts, options, avoidZone) {
     const correctIdx = options.findIndex((o) => o.correct);
-    let slots = rng.shuffle(pts.map((_, i) => i));
+    const slots = rng.shuffle(pts.map((_, i) => i));
     const pick = slots.find((i) => pts[i].zone !== avoidZone);
     const slot = pick === undefined ? slots[0] : pick;
     const rest = slots.filter((i) => i !== slot);
@@ -352,14 +455,16 @@
     const pairs = { '+': [], '-': [] };
     for (let a = 1; a <= 9; a++) for (let b = 1; a + b <= 10; b++) pairs['+'].push([a, b]);
     for (let a = 2; a <= 10; a++) for (let b = 1; b < a; b++) pairs['-'].push([a, b]);
-    const nOpt = level === 1 ? 3 : 4;
 
     return {
-      nOpt,
-      // Maths Fun: every number shown is a whole number from 1 to 10 (operands, answer and every option).
-      maths(placer, prevKey, avoidZone) {
+      nMaths: objectCount('maths', level),
+      nColour: objectCount('colour', level),
+      // Maths Fun: addition AND subtraction at every level; every number shown is a whole number from 1 to 10
+      // (operands, answer and every option). Options are returned without positions; the caller places them.
+      maths(prevKey) {
+        const nOpt = objectCount('maths', level);
         for (let attempt = 0; attempt < 200; attempt++) {
-          if (!opBag.length) opBag = rng.shuffle(level === 1 ? ['+', '+', '+', '+'] : ['+', '-', '+', '-']);
+          if (!opBag.length) opBag = rng.shuffle(['+', '-', '+', '-']);
           const op = opBag[0];
           const [a, b] = rng.pick(pairs[op]);
           const ans = op === '+' ? a + b : a - b;
@@ -378,13 +483,14 @@
             stimulus: a + ' ' + op + ' ' + b,
             display: a + ' ' + (op === '+' ? '+' : '−') + ' ' + b + ' = ?',
             condition: op === '+' ? 'addition' : 'subtraction',
-            options: layoutOptions(rng, placer, opts, avoidZone)
+            options: opts
           };
         }
         throw new Error('Could not generate a maths item');
       },
       // Colour Merge Test: find the word printed in the target ink colour.
-      colour(placer, prevInk, avoidZone) {
+      colour(prevInk) {
+        const nOpt = objectCount('colour', level);
         for (let attempt = 0; attempt < 200; attempt++) {
           if (!condBag.length) condBag = rng.shuffle([true, false, false, false, false, false, false, true]);
           const target = rng.pick(COLOURS);
@@ -413,12 +519,52 @@
             display: target.name,
             answer: target.key,
             condition: congruent ? 'congruent' : 'incongruent',
-            options: layoutOptions(rng, placer, rng.shuffle(opts), avoidZone)
+            options: rng.shuffle(opts)
           };
         }
         throw new Error('Could not generate a colour item');
       }
     };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Session schedule: which game each trial belongs to                    */
+  /* ------------------------------------------------------------------ */
+
+  // "random": the three games are played in a random order each session (one block per game).
+  // "fixed": always Triangle, Maths, Colour.  "rotate": the order is rotated by the session number (counterbalanced
+  // across a participant's sessions).  "mixed": every round has one trial of each game in a random order.
+  const ORDER_MODES = [
+    { key: 'random', label: 'Random', help: 'A new random order of the games every session.' },
+    { key: 'fixed', label: 'Fixed', help: 'Always Triangle, Maths, Colour (the paper protocol).' },
+    { key: 'rotate', label: 'Rotate', help: 'Rotates the order with each session number so every game gets a turn at the start.' },
+    { key: 'mixed', label: 'Mixed', help: 'Trials of the three games are interleaved in random rounds.' }
+  ];
+  /**
+   * Returns { order, sched, mode } where order is the games in the order they first appear and sched[i] is the index into
+   * order of the game played in trial slot i (trialsPerGame trials of every game in total).
+   */
+  function buildSchedule(games, trialsPerGame, mode, rng, sessionNo) {
+    const canon = GAME_ORDER.filter((g) => games.includes(g));
+    const n = canon.length;
+    const m = ORDER_MODES.some((x) => x.key === mode) ? mode : 'random';
+    let order = canon.slice();
+    if (m === 'random' || m === 'mixed') order = rng.shuffle(order.slice());
+    else if (m === 'rotate') { const k = (Math.max(1, sessionNo | 0) - 1) % n; order = canon.slice(k).concat(canon.slice(0, k)); }
+    const sched = [];
+    if (m === 'mixed') {
+      let prevLast = -1;
+      for (let r = 0; r < trialsPerGame; r++) {
+        let round = rng.shuffle(order.map((_, i) => i));
+        // never play the same game twice in a row across a round boundary
+        if (n > 1 && round[0] === prevLast) { round = round.slice(1).concat(round[0]); }
+        round.forEach((i) => sched.push(i));
+        prevLast = round[round.length - 1];
+      }
+    } else {
+      order.forEach((_, i) => { for (let t = 0; t < trialsPerGame; t++) sched.push(i); });
+    }
+    return { order, sched, mode: m };
   }
 
   /* ------------------------------------------------------------------ */
@@ -587,7 +733,7 @@
   /* ------------------------------------------------------------------ */
 
   function summarizeTrials(session) {
-    return session.trials.map((tr) => {
+    return session.trials.map((tr, idx) => {
       const ev = session.events.filter((e) => e.game === tr.game && e.trial === tr.trial);
       const done = ev.filter((e) => e.outcome === 'correct');
       const responded = ev.filter((e) => e.outcome === 'correct' || (e.errorsBefore || 0) > 0);
@@ -600,6 +746,7 @@
         session_no: session.sessionNo,
         game: GAMES[tr.game].name,
         trial: tr.trial,
+        trial_seq: tr.seq == null ? idx + 1 : tr.seq,
         level: tr.level,
         tracking_mode: session.mode,
         duration_s: round(tr.activeMs / 1000, 1),
@@ -700,6 +847,7 @@
       C('session_no', '', 'int', 10, 'Session number for this participant (1 = first).'),
       C('game', '', 'text', 18, 'Triangle Reach, Maths Fun or Colour Merge Test.'),
       C('trial', '', 'int', 7, 'Trial number within the game (1-based).'),
+      C('trial_seq', '', 'int', 9, 'Position of the trial in the whole session (1 = first trial played). Use it to control for order and fatigue effects.'),
       C('level', '', 'int', 7, 'Difficulty level 1-3 (reach distance).'),
       C('tracking_mode', '', 'text', 13, '6dof (WebXR position tracking), motion (phone orientation + camera), touch (drag, demo) or sim (automated test).'),
       C('duration_s', 's', 'dec1', 10, 'Active trial time; excludes time paused for tracking loss or by the therapist.'),
@@ -755,9 +903,15 @@
       C('trial', '', 'int', 7, 'Trial number.'),
       C('item', '', 'int', 6, 'Item number within the trial.'),
       C('onset_s', 's', 'dec2', 9, 'Session time when the item appeared.'),
-      C('stimulus', '', 'text', 16, 'What was shown: triangle, the sum (e.g. 3 + 4) or the colour to find.'),
-      C('options', '', 'text', 40, 'Every option shown: label (or word/ink) @ zone. The zone is left or right, low or high, near or far, relative to the start point.'),
-      C('target_zone', '', 'text', 18, 'Region of the correct target: left/right, low/high, near/far from the start point.'),
+      C('stimulus', '', 'text', 16, 'What was shown: the triangles, the sum (e.g. 3 + 4) or the colour to find.'),
+      C('options', '', 'text', 40, 'Every object shown: label (or word/ink, or triangle) @ zone. The zone is left or right, low or high, near or far (depth, or distance from the middle of the screen in rotation modes).'),
+      C('set_size', 'count', 'int', 9, 'How many objects were on the screen together when this item appeared.'),
+      C('set_order', 'count', 'int', 9, 'Triangle Reach only: 1 = first triangle touched from the start ring, 2 = second triangle of the same set, and so on.'),
+      C('target_zone', '', 'text', 18, 'Region of the correct target: left/right of the screen middle, low/high, near/far.'),
+      C('target_screen_x', '-1..1', 'dec2', 10, 'Where the correct target was on the screen when it appeared: -1 = left edge, +1 = right edge.'),
+      C('target_screen_y', '-1..1', 'dec2', 10, 'Where the correct target was on the screen when it appeared: -1 = bottom edge, +1 = top edge.'),
+      C('target_depth_cm', 'cm', 'dec1', 10, 'How far in front of the phone the correct target was when it appeared (position tracking: the forward reach needed).'),
+      C('target_size_cm', 'cm', 'dec1', 10, 'World height of the correct target.'),
       C('target_x_cm', 'cm', 'dec1', 10, 'Correct target position, right of the start point (negative = left). Angular modes: on the 50 cm aiming sphere.'),
       C('target_y_cm', 'cm', 'dec1', 10, 'Correct target position, above the start point (negative = below).'),
       C('target_z_cm', 'cm', 'dec1', 10, 'Correct target position, in front of the start point (negative = behind).'),
@@ -778,7 +932,7 @@
       C('straight_cm', 'cm', 'dec1', 9, 'Straight-line distance from start position to target entry.'),
       C('path_eff', 'ratio', 'dec3', 8, 'straight_cm / path_cm.'),
       C('peak_speed_cms', 'cm/s', 'dec1', 11, 'Peak cursor speed during the reach.'),
-      C('condition', '', 'text', 14, 'Triangle Reach: zone; Maths Fun: addition or subtraction; Colour Merge Test: congruent or incongruent.')
+      C('condition', '', 'text', 14, 'Triangle Reach: size of the set (e.g. set of 4); Maths Fun: addition or subtraction; Colour Merge Test: congruent or incongruent.')
     ],
     Kinematics: [
       C('participant_id', '', 'text', 14, 'Pseudonymous participant code.'),
@@ -805,7 +959,7 @@
       C('t_s', 's', 'dec2', 8, 'Session time of the event.'),
       C('game', '', 'text', 16, 'Game name, Calibration or Range check.'),
       C('trial', '', 'int', 6, 'Trial number (blank outside trials).'),
-      C('event', '', 'text', 18, 'calibration, calibration_override, range_dot, tracking_lost, tracking_restored, recentre, pause, resume, camera, wake_lock.'),
+      C('event', '', 'text', 18, 'calibration, calibration_override, range_dot, tracking_lost, tracking_restored, recentre, pause, resume, camera, wake_lock, init_movement (path in cm of the 5 s start-up movement), practice_start, practice_end (value = practice score), practice_skipped. Practice rows have no trial number.'),
       C('value', '', 'dec2', 9, 'Numeric value of the event (e.g. lost duration in ms, rate in Hz).'),
       C('detail', '', 'text', 50, 'Description.')
     ],
@@ -836,7 +990,13 @@
       C('affected_side', '', 'text', 11, 'Affected side.'),
       C('hand_mode', '', 'text', 16, 'Affected hand alone, or assisted by the unaffected hand.'),
       C('tracking_mode', '', 'text', 13, 'Tracking mode used.'),
+      C('protocol_week', '', 'int', 9, 'Week of the 2-week protocol (sessions 1-5 = week 1, 6-10 = week 2, further sessions continue counting).'),
       C('level', '', 'int', 7, 'Difficulty level.'),
+      C('object_distance', '', 'text', 10, 'Object distance setting: Close, Medium or Far (how far away and how widely spread the objects are).'),
+      C('object_size', '', 'text', 9, 'Object size setting: Small, Medium or Large.'),
+      C('game_order_setting', '', 'text', 12, 'How the order of the games was chosen: Random, Fixed, Rotate or Mixed.'),
+      C('game_sequence', '', 'text', 40, 'The order in which the trials were actually played (runs of the same game are collapsed, for example Maths Fun x5 > Triangle Reach x5).'),
+      C('practice_trial', '0/1', 'int', 9, '1 if a short unrecorded practice trial was played before each game.'),
       C('trials_per_game', '', 'int', 10, 'Planned trials per game.'),
       C('trial_s', 's', 'int', 8, 'Planned trial length.'),
       C('complete', '0/1', 'int', 9, '1 if every planned trial was played.'),
@@ -844,8 +1004,12 @@
       C('cal_jitter_cm', 'cm', 'dec2', 11, 'Calibration jitter (RMS distance from mean while holding still).'),
       C('cal_pass', '0/1', 'int', 9, '1 if calibration passed every check.'),
       C('cal_override', '0/1', 'int', 11, '1 if the therapist continued after a failed check.'),
-      C('adverse_events', '', 'text', 24, 'Adverse events noted by the therapist.'),
-      C('notes', '', 'text', 30, 'Session notes.')
+      C('briefed', '0/1', 'int', 8, '1 if the therapist confirmed that the participant was told about possible shoulder or elbow pain and fatigue before starting.'),
+      C('adverse_tags', '', 'text', 24, 'Adverse events ticked at the end of the session (shoulder pain, elbow pain, fatigue, dizziness, other).'),
+      C('adverse_events', '', 'text', 24, 'Adverse events noted by the therapist, free text.'),
+      C('notes', '', 'text', 30, 'Session notes.'),
+      C('session_title', '', 'text', 24, 'Title given to the session by the study team in the admin board (empty if none).'),
+      C('comment_count', '', 'int', 10, 'Number of comments the study team wrote on this session (see the Comments sheet).')
     ],
     Questionnaire: [
       C('participant_id', '', 'text', 14, 'Pseudonymous participant code.'),
@@ -854,6 +1018,31 @@
       C('question', '', 'text', 60, 'Question text (after the USEQ-based questionnaire in Li et al. 2021).'),
       C('response_score', '1-5', 'int', 12, 'Rating for Q1-Q7: 1 strongly disagree ... 5 strongly agree. Empty for the free-text questions and when skipped.'),
       C('response_text', '', 'text', 40, 'Free-text answer for Q8-Q9. Empty for rated questions.')
+    ],
+    // Notes the study team wrote on a session in the admin board.
+    Comments: [
+      C('participant_id', '', 'text', 14, 'Pseudonymous participant code.'),
+      C('session_no', '', 'int', 10, 'Session number the comment belongs to.'),
+      C('session_date', '', 'text', 12, 'Date of the session, YYYY-MM-DD.'),
+      C('comment_time', '', 'text', 18, 'When the comment was written (UTC, YYYY-MM-DD HH:MM).'),
+      C('author', '', 'text', 24, 'Staff member who wrote it.'),
+      C('comment', '', 'text', 80, 'The comment.')
+    ],
+    // Filled in by the research team, not by the app: the outcome measures are clinician-administered in the paper.
+    Clinical_Scores: [
+      C('participant_id', '', 'text', 14, 'Pseudonymous participant code (same as in the other sheets).'),
+      C('timepoint', '', 'text', 12, 'Baseline, Mid, Post or Follow-up.'),
+      C('assessment_date', '', 'text', 14, 'Date of the assessment, YYYY-MM-DD.'),
+      C('assessor', '', 'text', 10, 'Assessor initials.'),
+      C('fma_ue', '0-66', 'int', 9, 'Fugl-Meyer Assessment, upper extremity (motor), 0 to 66.'),
+      C('arat', '0-57', 'int', 8, 'Action Research Arm Test, 0 to 57.'),
+      C('mmt', '0-5', 'int', 8, 'Manual Muscle Testing grade, 0 to 5.'),
+      C('brunnstrom', '1-6', 'int', 12, 'Brunnstrom recovery stage, 1 to 6.'),
+      C('mmse', '0-30', 'int', 8, 'Mini-Mental State Examination, 0 to 30.'),
+      C('barthel', '0-100', 'int', 9, 'Barthel Index, 0 to 100.'),
+      C('avs_score', '', 'dec1', 10, 'Paper one-minute Add vs Subtract task score (paper test used in the study).'),
+      C('sg_score', '', 'dec1', 10, 'Paper one-minute Stroop-type task score (paper test used in the study).'),
+      C('notes', '', 'text', 30, 'Free text.')
     ]
   };
 
@@ -879,7 +1068,13 @@
       onset_s: round(e.onsetMs / 1000, 2),
       stimulus: e.stimulus,
       options: e.options,
+      set_size: e.setSize == null ? null : e.setSize,
+      set_order: e.setOrder == null ? null : e.setOrder,
       target_zone: e.zone,
+      target_screen_x: e.screenX == null ? null : e.screenX,
+      target_screen_y: e.screenY == null ? null : e.screenY,
+      target_depth_cm: e.depthCm == null ? null : e.depthCm,
+      target_size_cm: e.sizeCm == null ? null : e.sizeCm,
       target_x_cm: e.targetX,
       target_y_cm: e.targetY,
       target_z_cm: e.targetZ,
@@ -941,7 +1136,13 @@
       affected_side: s.affectedSide,
       hand_mode: s.handMode,
       tracking_mode: s.mode,
+      protocol_week: Math.ceil((s.sessionNo || 1) / PROTOCOL.perWeek),
       level: s.level,
+      object_distance: (DISTANCES[s.distance || 'medium'] || DISTANCES.medium).label,
+      object_size: (OBJECT_SIZES[s.objectSize || 'medium'] || OBJECT_SIZES.medium).label,
+      game_order_setting: (ORDER_MODES.find((x) => x.key === s.orderMode) || { label: 'Fixed' }).label,
+      game_sequence: sequenceLabel(s.sequence && s.sequence.length ? s.sequence : (s.games || []).flatMap((g) => Array(s.trialsPerGame || 0).fill(g)), (g) => GAMES[g].name),
+      practice_trial: s.practice ? 1 : 0,
       trials_per_game: s.trialsPerGame,
       trial_s: s.trialSec,
       complete: s.complete ? 1 : 0,
@@ -949,8 +1150,12 @@
       cal_jitter_cm: s.calibration ? round(s.calibration.jitterCm, 2) : null,
       cal_pass: s.calibration ? (s.calibration.pass ? 1 : 0) : null,
       cal_override: s.calibration ? (s.calibration.override ? 1 : 0) : null,
+      briefed: s.briefed == null ? null : s.briefed ? 1 : 0,
+      adverse_tags: (s.adverseTags || []).map(adverseLabel).join('; '),
       adverse_events: s.adverse || '',
-      notes: s.notes || ''
+      notes: s.notes || '',
+      session_title: s.title || '',
+      comment_count: (s.comments || []).length
     };
   }
 
@@ -968,6 +1173,12 @@
     rows.push([s.participantId, s.sessionNo, 'Q8', 'Did you experience any negative symptoms during or after gameplay?', null, q.negative || '']);
     rows.push([s.participantId, s.sessionNo, 'Q9', 'What are some suggestions you have that you think could improve the system?', null, q.suggestions || '']);
     return rows;
+  }
+
+  // Comments the study team added in the admin board (s.comments = [{ at, author, text }]).
+  function commentRows(s) {
+    return (s.comments || []).slice().sort((a, b) => String(a.at).localeCompare(String(b.at)))
+      .map((c) => [s.participantId, s.sessionNo, localDate(s.startedAt, s.tzOffsetMin), String(c.at || '').replace('T', ' ').slice(0, 16), c.author || '', c.text || '']);
   }
 
   function dictionarySheet(sheetNames) {
@@ -1012,10 +1223,17 @@
       ['Affected side', s.affectedSide],
       ['Hand mode', s.handMode],
       ['Difficulty level', s.level],
-      ['Reach distance', s.mode === '6dof' ? LEVELS[s.level].cm + ' cm' : LEVELS[s.level].deg + ' degrees'],
+      ['Object distance setting', (DISTANCES[s.distance || 'medium'] || DISTANCES.medium).label],
+      ['Object size setting', (OBJECT_SIZES[s.objectSize || 'medium'] || OBJECT_SIZES.medium).label],
+      ['Forward reach range', s.mode === '6dof' || s.mode === 'sim' ? depthRange('linear', s.level, s.distance || 'medium').map((x) => Math.round(x * 100)).join(' to ') + ' cm in front of the start point' : 'Not measured (rotation only)'],
+      ['Objects on screen at once', 'Triangles ' + objectCount('triangle', s.level) + ', Maths ' + objectCount('maths', s.level) + ', Colour ' + objectCount('colour', s.level)],
       ['Games played', (s.games || []).map((g) => GAMES[g].name).join(', ')],
+      ['Game order setting', (ORDER_MODES.find((x) => x.key === s.orderMode) || { label: 'Fixed (older sessions)' }).label],
+      ['Order games were played', sequenceLabel(s.sequence && s.sequence.length ? s.sequence : (s.games || []).flatMap((g) => Array(s.trialsPerGame || 0).fill(g)), (g) => GAMES[g].name)],
+      ['Protocol position', 'Session ' + s.sessionNo + ' of ' + PROTOCOL.sessions + ' (week ' + Math.ceil((s.sessionNo || 1) / PROTOCOL.perWeek) + ' of ' + PROTOCOL.weeks + ')'],
       ['Trials per game', s.trialsPerGame],
       ['Trial length (s)', s.trialSec],
+      ['Practice trial before each game', s.practice ? 'Yes (short, not recorded or scored)' : 'No'],
       ['Touch dwell (ms)', s.dwellMs],
       ['Item time limit (s)', s.itemTimeoutSec],
       ['Tracking mode', s.mode],
@@ -1028,8 +1246,12 @@
       ['Calibration attempts', cal.attempts || 1],
       ['Range check', (cal.range || []).map((r) => dirName(r.dir) + ': ' + (r.reached ? (r.ms / 1000).toFixed(1) + ' s' : 'not reached')).join('; ')],
       ['Random seed', s.seed],
+      ['Participant briefed on risks', s.briefed == null ? 'Not recorded' : s.briefed ? 'Yes (shoulder or elbow pain, fatigue, stop if it hurts)' : 'No'],
+      ['Adverse event tags', (s.adverseTags || []).length ? s.adverseTags.map(adverseLabel).join('; ') : 'None ticked'],
       ['Adverse events', s.adverse || 'None recorded'],
       ['Notes', s.notes || ''],
+      ['Session title (admin)', s.title || ''],
+      ['Comments from the study team', (s.comments || []).length ? (s.comments || []).length + ' (see the Comments sheet)' : 'None'],
       ['App version', s.appVersion || VERSION],
       ['Generated', new Date().toISOString()]
     ];
@@ -1041,16 +1263,17 @@
       { name: 'Kinematics', columns: colsToSheetCols(COLS.Kinematics), rows: (s.kin || []).map((r) => [s.participantId, s.sessionNo].concat(r)) },
       { name: 'Sensor_Quality', columns: colsToSheetCols(COLS.Sensor_Quality), rows: qualityRows(s) },
       { name: 'Questionnaire', columns: colsToSheetCols(COLS.Questionnaire), rows: questionnaireRows(s) },
-      { name: 'Progress', columns: colsToSheetCols(COLS.Progress), rows: rowsFrom(COLS.Progress, all.map(progressRow)) }
+      { name: 'Progress', columns: colsToSheetCols(COLS.Progress), rows: rowsFrom(COLS.Progress, all.map(progressRow)) },
+      { name: 'Comments', columns: colsToSheetCols(COLS.Comments), rows: commentRows(s) }
     ];
-    sheets.push(dictionarySheet(['Trial_Summary', 'Game_Summary', 'Events', 'Kinematics', 'Sensor_Quality', 'Questionnaire', 'Progress']));
+    sheets.push(dictionarySheet(['Trial_Summary', 'Game_Summary', 'Events', 'Kinematics', 'Sensor_Quality', 'Questionnaire', 'Progress', 'Comments']));
     return { title: 'CARS ' + s.participantId + ' session ' + s.sessionNo, sheets };
   }
 
   // Whole-study workbook: every session stored on the device (kinematics left out for size).
   function studyWorkbookSpec(sessions) {
     const list = sessions.slice().sort((a, b) => String(a.participantId).localeCompare(String(b.participantId)) || a.sessionNo - b.sessionNo);
-    const trials = [], games = [], events = [], quality = [], questions = [];
+    const trials = [], games = [], events = [], quality = [], questions = [], comments = [];
     list.forEach((s) => {
       const t = summarizeTrials(s);
       trials.push(...t);
@@ -1058,6 +1281,7 @@
       s.events.forEach((e) => events.push(eventRow(s, e)));
       quality.push(...qualityRows(s));
       questions.push(...questionnaireRows(s));
+      comments.push(...commentRows(s));
     });
     const sheets = [
       { name: 'Sessions', columns: colsToSheetCols(COLS.Sessions), rows: rowsFrom(COLS.Sessions, list.map(sessionRow)) },
@@ -1066,9 +1290,11 @@
       { name: 'Game_Summary', columns: colsToSheetCols(COLS.Game_Summary), rows: rowsFrom(COLS.Game_Summary, games) },
       { name: 'Events', columns: colsToSheetCols(COLS.Events), rows: rowsFrom(COLS.Events, events) },
       { name: 'Sensor_Quality', columns: colsToSheetCols(COLS.Sensor_Quality), rows: quality },
-      { name: 'Questionnaire', columns: colsToSheetCols(COLS.Questionnaire), rows: questions }
+      { name: 'Questionnaire', columns: colsToSheetCols(COLS.Questionnaire), rows: questions },
+      { name: 'Comments', columns: colsToSheetCols(COLS.Comments), rows: comments },
+      { name: 'Clinical_Scores', columns: colsToSheetCols(COLS.Clinical_Scores), rows: [] }
     ];
-    sheets.push(dictionarySheet(['Sessions', 'Progress', 'Trial_Summary', 'Game_Summary', 'Events', 'Sensor_Quality', 'Questionnaire']));
+    sheets.push(dictionarySheet(['Sessions', 'Progress', 'Trial_Summary', 'Game_Summary', 'Events', 'Sensor_Quality', 'Questionnaire', 'Comments', 'Clinical_Scores']));
     return { title: 'CARS study export', sheets };
   }
 
@@ -1288,9 +1514,9 @@
 
   return {
     VERSION, GAMES, GAME_ORDER, LEVELS, DIRS, DIR_NAMES, COLOURS, CAL_RULES, QUESTIONS, COLS,
-    TARGET_RADIUS_M, TOUCH_RADIUS_LINEAR_M, HOME_RADIUS_M, AHEAD_ANGULAR_M, AHEAD_6DOF_M, DEG, CELLS,
+    TARGET_RADIUS_M, TOUCH_RADIUS_LINEAR_M, HOME_RADIUS_M, AHEAD_ANGULAR_M, AHEAD_6DOF_M, DEG, DISTANCES, DISTANCE_KEYS, OBJECT_SIZES, SIZE_KEYS, OBJ, SCREEN,
     makeRng, v3, quat, deviceOrientationToQuat, forwardOf, yawPitchRoll, yawPitchToward, cursorFromPose,
-    makeCalibration, calToWorld, toCalFrame, angDiff, dirName, reachRadius, specToPos, rangePoint, makePlacer, layoutOptions, makeItemSource,
+    PROTOCOL, ADVERSE_TAGS, adverseLabel, sequenceLabel, ORDER_MODES, buildSchedule, makeCalibration, calToWorld, toCalFrame, angDiff, dirName, reachRadius, depthRange, objectCount, rayPoint, layoutOnScreen, zoneOf, rangePoint, makePlacer, layoutOptions, makeItemSource,
     
     OneEuro3, TrackingHealth, measureCalibration, ReachTracker,
     round, mean, median, sd,

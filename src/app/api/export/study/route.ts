@@ -10,7 +10,8 @@ export async function GET(req: Request) {
   const u = new URL(req.url).searchParams;
   const q = {
     since: u.get('since') || undefined, until: u.get('until') ? u.get('until') + 'T23:59:59.999Z' : undefined,
-    group: u.get('group') || undefined, mode: u.get('mode') || undefined, limit: 5000
+    group: u.get('group') || undefined, mode: u.get('mode') || undefined,
+    participant: (u.get('participant') || '').toUpperCase().trim() || undefined, flaggedOnly: u.get('flagged') === '1' || undefined, limit: 5000
   };
   const store = getStore();
   const rows = await loadFull((await store.listSessions(q)).map((r) => r.id));

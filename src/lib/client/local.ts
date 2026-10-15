@@ -1,4 +1,4 @@
-/* On-phone storage: device enrolment, study defaults, and an offline queue of finished sessions (IndexedDB). */
+/* On-phone storage: the phone's upload token, study defaults, and an offline queue of finished sessions (IndexedDB). */
 import type { SessionInput, Settings } from '../schema';
 import { DEFAULT_SETTINGS } from '../schema';
 
@@ -77,22 +77,43 @@ async function api(path: string, init: RequestInit & { token?: string } = {}) {
   try { return await fetch(path, { ...rest, headers, signal: ctl.signal, cache: 'no-store' }); } finally { clearTimeout(to); }
 }
 
-export async function enrolDevice(code: string): Promise<{ ok: true; device: DeviceInfo; settings: Settings } | { ok: false; error: string }> {
+/** The phone registers itself with the study the first time it is online with something to send: no code, no scan. */
+async function registerDevice(): Promise<DeviceInfo | null> {
   try {
-    const r = await api('/api/enrol', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, model: navigator.userAgent.slice(0, 190) }) });
+    const r = await api('/api/device', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (!r.ok) return null;
     const j = await r.json();
-    if (!r.ok) return { ok: false, error: j.error || 'Could not enrol' };
-    const device = { token: j.token, label: j.label };
+    const device = { token: j.token as string, label: j.label as string };
     setDevice(device); if (j.settings) setSettings(j.settings);
-    return { ok: true, device, settings: j.settings };
-  } catch { return { ok: false, error: 'No connection. Connect to the internet to enrol this phone.' }; }
+    return device;
+  } catch { return null; }
+}
+let registering: Promise<DeviceInfo | null> | null = null;
+async function ensureDevice(): Promise<DeviceInfo | null> {
+  const d = getDevice(); if (d) return d;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return null;
+  if (!registering) registering = registerDevice().finally(() => { registering = null; });
+  return registering;
+}
+
+/** A call the study needs to know the phone for. 'revoked' means staff removed this phone; null means no connection or no way to register right now. */
+async function authed(path: string, init: RequestInit = {}): Promise<Response | 'revoked' | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const d = await ensureDevice(); if (!d) return null;
+    const r = await api(path, { ...init, token: d.token });
+    if (r.status !== 401) return r;
+    const j = await r.clone().json().catch(() => ({}));
+    if (j.code === 'revoked') return 'revoked';
+    setDevice(null);   // the study does not know this token (for example its database was reset): register again once
+  }
+  return null;
 }
 
 export async function refreshConfig(): Promise<'ok' | 'revoked' | 'offline'> {
-  const d = getDevice(); if (!d) return 'offline';
   try {
-    const r = await api('/api/config', { token: d.token });
-    if (r.status === 401) return 'revoked';
+    const d = getDevice();
+    const r = await api('/api/config', { token: d?.token });
+    if (r.status === 401) { const j = await r.json().catch(() => ({})); return j.code === 'revoked' ? 'revoked' : 'ok'; }
     if (!r.ok) return 'offline';
     const j = await r.json(); if (j.settings) setSettings(j.settings);
     return 'ok';
@@ -101,10 +122,10 @@ export async function refreshConfig(): Promise<'ok' | 'revoked' | 'offline'> {
 
 export async function nextSessionNo(code: string): Promise<number> {
   const local = await nextSessionNoLocal(code);
-  const d = getDevice(); if (!d) return local;
+  if (!getDevice()) return local;   // a phone that has not uploaded yet counts its own sessions
   try {
-    const r = await api('/api/participants/' + encodeURIComponent(code) + '/next', { token: d.token });
-    if (r.ok) { const j = await r.json(); return Math.max(local, j.next); }
+    const r = await authed('/api/participants/' + encodeURIComponent(code) + '/next');
+    if (r && r !== 'revoked' && r.ok) { const j = await r.json(); return Math.max(local, j.next); }
   } catch { /* offline: local number */ }
   return local;
 }
@@ -114,19 +135,22 @@ export type SyncResult = { sent: number; failed: number; pending: number; revoke
 /** Upload everything not yet on the server. Safe to call repeatedly: uploads are idempotent on the session id. */
 export async function syncAll(): Promise<SyncResult> {
   const out: SyncResult = { sent: 0, failed: 0, pending: 0, revoked: false };
-  const d = getDevice();
-  if (!d || syncing || (typeof navigator !== 'undefined' && navigator.onLine === false)) { out.pending = (await allSessions()).filter((s) => s.state === 'pending').length; return out; }
+  const waiting = async () => (await allSessions()).filter((s) => s.state === 'pending');
+  if (syncing || (typeof navigator !== 'undefined' && navigator.onLine === false)) { out.pending = (await waiting()).length; return out; }
   syncing = true;
   try {
-    for (const s of (await allSessions()).filter((x) => x.state === 'pending').reverse()) {
+    for (const s of (await waiting()).reverse()) {
       try {
-        const r = await api('/api/sessions', { method: 'POST', token: d.token, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...s.record, kinRows: s.kin.length }) });
-        if (r.status === 401) { out.revoked = true; break; }
+        const r = await authed('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...s.record, kinRows: s.kin.length }) });
+        if (r === 'revoked') { out.revoked = true; break; }
+        if (!r) throw new Error('No connection');
         if (r.status === 422 || r.status === 413) { const j = await r.json().catch(() => ({})); await saveSession({ ...s, state: 'rejected', lastError: (j.error || 'Rejected') + (j.issues ? ': ' + j.issues.join('; ') : ''), attempts: s.attempts + 1 }); out.failed++; continue; }
         if (!r.ok) throw new Error('HTTP ' + r.status);
         let kinOk = s.kinUploaded;
         if (!kinOk && s.kin.length) {
-          const k = await api('/api/sessions/' + s.id + '/kin', { method: 'PUT', token: d.token, headers: { 'Content-Type': 'application/gzip' }, body: await gzip(JSON.stringify(s.kin)) });
+          const k = await authed('/api/sessions/' + s.id + '/kin', { method: 'PUT', headers: { 'Content-Type': 'application/gzip' }, body: await gzip(JSON.stringify(s.kin)) });
+          if (k === 'revoked') { out.revoked = true; break; }
+          if (!k) throw new Error('No connection');
           if (!k.ok && k.status !== 413 && k.status !== 422) throw new Error('Movement file HTTP ' + k.status);
           kinOk = k.ok;
         } else kinOk = true;
@@ -138,7 +162,7 @@ export async function syncAll(): Promise<SyncResult> {
       }
     }
   } finally { syncing = false; }
-  out.pending = (await allSessions()).filter((s) => s.state === 'pending').length;
+  out.pending = (await waiting()).length;
   return out;
 }
 

@@ -15,6 +15,7 @@ export const participantCode = z.string().trim().toUpperCase().regex(/^[A-Z0-9_-
 const trialSchema = z.object({
   game: z.enum(GAME_KEYS),
   trial: z.number().int().min(1).max(100),
+  seq: z.number().int().min(1).max(300).optional(),
   level: z.number().int().min(1).max(3),
   activeMs: n.min(0).max(1_000_000),
   pauseMs: n.min(0).max(10_000_000).optional(),
@@ -34,6 +35,7 @@ const eventSchema = z.object({
   stimulus: short(60),
   options: short(300),
   zone: short(24).nullable().optional(),
+  setSize: nn, setOrder: nn, screenX: nn, screenY: nn, depthCm: nn, sizeCm: nn,
   targetX: nn, targetY: nn, targetZ: nn, targetAz: nn, targetEl: nn, targetReachCm: nn, startToTargetCm: nn,
   correctAnswer: short(20).nullable().optional(),
   firstResponse: short(20).nullable().optional(),
@@ -70,6 +72,11 @@ export const sessionSchema = z.object({
   itemTimeoutSec: z.number().int().min(3).max(60),
   camera: short(20).optional(),
   homeGate: z.boolean().optional(),
+  practice: z.boolean().optional(),
+  distance: z.enum(['near', 'medium', 'far']).optional(),
+  objectSize: z.enum(['small', 'medium', 'large']).optional(),
+  orderMode: z.enum(['random', 'fixed', 'rotate', 'mixed']).optional(),
+  sequence: z.array(z.enum(GAME_KEYS)).max(300).optional(),
   device: short(300).optional(),
   seed: z.number().int(),
   appVersion: short(20).optional(),
@@ -77,6 +84,8 @@ export const sessionSchema = z.object({
   startedAt: z.string().datetime({ offset: true }),
   endedAt: z.string().datetime({ offset: true }),
   complete: z.boolean(),
+  briefed: z.boolean().optional(),
+  adverseTags: z.array(z.enum(['shoulder_pain', 'elbow_pain', 'fatigue', 'dizziness', 'other'])).max(8).optional(),
   adverse: short(1000).optional(),
   notes: short(2000).optional(),
   calibration: z.object({
@@ -108,4 +117,4 @@ export const settingsSchema = z.object({
   groups: z.array(short(20)).min(1).max(8)
 });
 export type Settings = z.infer<typeof settingsSchema>;
-export const DEFAULT_SETTINGS: Settings = { trialsPerGame: 5, trialSec: 60, dwellMs: 250, itemTimeoutSec: 12, level: 2, groups: ['Intervention', 'Control'] };
+export const DEFAULT_SETTINGS: Settings = { trialsPerGame: 5, trialSec: 120, dwellMs: 250, itemTimeoutSec: 12, level: 2, groups: ['Intervention', 'Control'] };

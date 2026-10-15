@@ -1,9 +1,10 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import core from '../core';
 import type { Mode, Q4, Sensor, V3 } from './sensors';
-import { ArView, type ViewCam, type ViewFrame, type ViewObj, type ObjKind } from './arview';
+import { ArView, FOV_Y, type ViewCam, type ViewFrame, type ViewObj, type ObjKind } from './arview';
 import { mat4 } from './glmath';
 import type { Cue } from './sfx';
+import { haptic } from './haptics';
 import type { SessionInput } from '../schema';
 
 export type GameKey = 'triangle' | 'maths' | 'colour';
@@ -12,11 +13,23 @@ export interface SessionConfig {
   participantId: string; sessionNo: number; group: string; therapist: string; affectedSide: string; handMode: string;
   mode: Mode; level: 1 | 2 | 3; games: GameKey[]; trialsPerGame: number; trialSec: number; dwellMs: number; itemTimeoutSec: number;
   camera: 'on' | 'off'; homeGate: boolean; device: string; seed: number; skipRange?: boolean;
+  /** One short unrecorded practice trial before each game (paper, procedure). */
+  practice?: boolean;
+  /** How far away the objects are and how widely they are spread over the screen. */
+  distance?: 'near' | 'medium' | 'far';
+  /** Size of the triangles, numbers and words. */
+  objectSize?: 'small' | 'medium' | 'large';
+  /** The therapist confirmed the participant was told about possible shoulder or elbow pain and fatigue. */
+  briefed?: boolean;
+  /** A demo run: nothing is saved. */
+  demo?: boolean;
+  /** Order of the games: random blocks, fixed, rotated by session number, or trials mixed together. */
+  order?: 'random' | 'fixed' | 'rotate' | 'mixed';
 }
 
 export type Phase = 'idle' | 'starting' | 'cal_ready' | 'cal_hold' | 'cal_result' | 'range' | 'game_intro' | 'countdown' | 'playing' | 'trial_end' | 'finished' | 'error';
 export interface CalResult { rateHz: number; jitterCm: number | null; pass: boolean; reasons: string[]; minRate: number; maxJitterCm: number }
-export interface TrialEnd { game: GameKey; trial: number; score: number; correct: number; errors: number; misses: number; accuracyPct: number | null; rtMeanMs: number | null; validPct: number | null; dropouts: number }
+export interface TrialEnd { game: GameKey; trial: number; practice: boolean; score: number; correct: number; errors: number; misses: number; accuracyPct: number | null; rtMeanMs: number | null; validPct: number | null; dropouts: number }
 
 export interface Snapshot {
   phase: Phase; error: string | null;
@@ -27,10 +40,24 @@ export interface Snapshot {
   timeLeftS: number; score: number; itemNo: number;
   prompt: { caption: string; main: string } | null;
   countdown: number; trialEnd: TrialEnd | null; isLast: boolean; elapsedS: number;
+  /** AR start-up: 0..1 progress of the 5 s back-and-forth movement that initialises position tracking. */
+  init: number;
+  /** True while the trial on screen (countdown, play, result) is the unrecorded practice trial. */
+  practice: boolean;
+  /** True on a game's intro screen when the next trial to start is the practice trial. */
+  practiceNext: boolean;
+  /** Length in seconds of the trial that is, or is about to be, played. */
+  trialSecNow: number;
+  /** Position in the whole session: trial slot (0-based) and total number of recorded trials. */
+  slot: number; slots: number;
+  /** What comes after the trial that just ended (null at the very end), and whether it starts a different game. */
+  nextGame: GameKey | null; nextNewGame: boolean;
 }
 
 interface Target {
   id: number; kind: ObjKind; pos: V3; zone: string; az: number; el: number; reachCm: number;
+  /** World height (m), depth from the phone (cm), screen position (-1..1) and a cosmetic variant. */
+  size: number; depthCm: number; ndc: [number, number]; variant: number;
   opt: any | null; state: 'idle' | 'disabled' | 'wrong' | 'correct';
   dwell: number; enteredT: number | null; enteredP: V3 | null; stateT: number; bornT: number; hot: boolean;
 }
@@ -38,24 +65,30 @@ interface Item {
   n: number; game: GameKey; data: any; targets: Target[]; onsetWall: number; onsetGame: number; tracker: any; start: V3;
   errors: number; firstResponse: string | null; stimulus: string; optionsText: string; correct: Target;
   correctAnswer: string; condition: string; closed: boolean;
+  /** Triangle Reach shows several triangles at once; each one touched is its own row in the data. */
+  multi: boolean; setSize: number; touched: number;
 }
 
 const RANGE_DIRS = [0, 90, 180, 270];
 const RANGE_TIMEOUT_MS = 12000;
 const HOME_HOLD_MS = 200;
+/** Paper: "5 s of back-and-forth movement to initialise the system" (position tracking needs some parallax to lock on). */
+const INIT_MS = 5000;
+/** Practice trials are short: long enough to learn the game, short enough not to tire an affected arm. */
+const PRACTICE_SEC = 20;
 const KIN_DT = 50;
 const FEEDBACK_OK_MS = 500;
 const FEEDBACK_MISS_MS = 400;
 const HOME_R = core.HOME_RADIUS_M as number;
 const GAME_TEXT: Record<GameKey, { how: string; caption: string }> = {
-  triangle: { how: 'Triangles float around you in the room. Reach to touch each one with the phone. Each new triangle appears somewhere else, so you will reach in different directions.', caption: 'Touch the triangle' },
-  maths: { how: 'A sum appears in the middle. Numbers float around you. Reach and touch the number that is the answer. All numbers are from 1 to 10.', caption: 'Touch the answer' },
-  colour: { how: 'A colour name appears in the middle. Words float around you, each written in a colour of ink. Touch the word whose INK is the colour named. Ignore what the words say.', caption: 'Touch the word written in this colour' }
+  triangle: { how: 'Several triangles float in the room in front of you. Reach out with the phone and touch every one of them, in any order. Each new set appears in different places, so you reach in different directions.', caption: 'Touch the triangles' },
+  maths: { how: 'A sum appears in the middle of the screen and numbers float around it. Reach out and touch the number that is the answer. Every number is from 1 to 10.', caption: 'Touch the answer' },
+  colour: { how: 'A colour name appears in the middle. Words float around it, each written in a colour of ink. Touch the word whose INK is the colour named. Ignore what the words say.', caption: 'Touch the word written in this colour' }
 };
 const GAME_TEXT_ANGULAR: Record<GameKey, string> = {
-  triangle: 'Triangles float around you in the room. Turn the phone so the ring in the middle of the screen lands on a triangle, and hold. Each new triangle appears somewhere else.',
-  maths: 'A sum appears in the middle. Numbers float around you. Turn the phone so the ring lands on the number that is the answer, and hold. All numbers are from 1 to 10.',
-  colour: 'A colour name appears in the middle. Words float around you, each written in a colour of ink. Aim the ring at the word whose INK is the colour named, and hold.'
+  triangle: 'Several triangles float in front of you. Turn the phone so the ring in the middle of the screen lands on a triangle, and hold. Touch them all, in any order.',
+  maths: 'A sum appears in the middle and numbers float around it. Turn the phone so the ring lands on the number that is the answer, and hold. Every number is from 1 to 10.',
+  colour: 'A colour name appears in the middle. Words float around it, each written in a colour of ink. Aim the ring at the word whose INK is the colour named, and hold.'
 };
 export const gameInfo = (k: GameKey, mode?: Mode) => ({
   name: core.GAMES[k].name as string,
@@ -71,7 +104,9 @@ function emptySnap(cfg: SessionConfig): Snapshot {
     cal: { progress: 0, result: null, attempts: 0 },
     range: { index: 0, total: RANGE_DIRS.length, secLeft: 0, results: [] },
     game: null, gameIndex: 0, gameCount: cfg.games.length, trialNo: 0, trialsTotal: cfg.trialsPerGame,
-    timeLeftS: cfg.trialSec, score: 0, itemNo: 0, prompt: null, countdown: 0, trialEnd: null, isLast: false, elapsedS: 0
+    timeLeftS: cfg.trialSec, score: 0, itemNo: 0, prompt: null, countdown: 0, trialEnd: null, isLast: false, elapsedS: 0,
+    init: 0, practice: false, practiceNext: false, trialSecNow: cfg.trialSec,
+    slot: 0, slots: cfg.games.length * cfg.trialsPerGame, nextGame: null, nextNewGame: false
   };
 }
 
@@ -102,7 +137,11 @@ export class Engine {
 
   // play
   private gameIdx = 0; private trialNo = 0;
-  private prevPl: any = null; private prevKey: string | undefined; private prevInk: string | undefined; private prevZone: string | undefined;
+  /** Games in the order they first appear; sched[i] = index (into order) of the game played in trial slot i. */
+  private order: GameKey[]; private sched: number[]; private slot = 0; private done: number[]; private seenGame = new Set<number>(); private orderMode: string;
+  private practicePending = false; private inPractice = false; private practiceEvents: any[] = [];
+  private initMs = 0; private initPath = 0; private initPrev: V3 | null = null;
+  private prevKey: string | undefined; private prevInk: string | undefined; private prevZone: string | undefined; private prevSet: V3[] = []; private lastTri: V3 | null = null;
   private sub: 'home' | 'reach' | 'feedback' = 'home'; private homeHold = 0; private feedbackUntil = 0;
   private item: Item | null = null; private itemCount = 0; private score = 0;
   private countdownStart = 0; private lostPrev = false; private manualPause = false; private pauseStart = 0;
@@ -120,7 +159,10 @@ export class Engine {
     this.kind = cfg.mode === '6dof' || cfg.mode === 'sim' ? 'linear' : 'angular';
     this.ahead = this.kind === 'linear' ? core.AHEAD_6DOF_M : core.AHEAD_ANGULAR_M;
     this.touchR = this.kind === 'linear' ? core.TOUCH_RADIUS_LINEAR_M : core.TARGET_RADIUS_M;
-    this.placer = core.makePlacer(this.rng, this.kind, cfg.level);
+    const sch = core.buildSchedule(cfg.games, cfg.trialsPerGame, cfg.order ?? 'fixed', this.rng, cfg.sessionNo);
+    this.order = sch.order as GameKey[]; this.sched = sch.sched; this.orderMode = sch.mode; this.gameIdx = this.sched[0] ?? 0; this.done = this.order.map(() => 0);
+    this.snap = { ...this.snap, gameCount: this.order.length, slots: this.sched.length };
+    this.placer = core.makePlacer(this.rng, this.kind, cfg.level, cfg.distance ?? 'medium', cfg.objectSize ?? 'medium');
     this.source = core.makeItemSource(this.rng, cfg.level);
     this.sensor.onEnd = (reason: string) => { if (!this.ended && !this.dead) this.fail('Tracking stopped (' + reason + '). Start again to continue.'); };
   }
@@ -184,7 +226,7 @@ export class Engine {
   acceptCalibration(override = false) {
     const r = this.calResult; if (!r || this.hold.length < 3) return;
     if (!r.pass && !override) return;
-    this.calOverride = !r.pass && override;
+    this.calOverride = !r.pass && override; haptic('cal');
     const n = this.hold.length; const eye: V3 = [0, 0, 0]; const fwd: V3 = [0, 0, 0];
     for (const s of this.hold) { for (let i = 0; i < 3; i++) { eye[i] += s.pos[i] / n; } const f = core.forwardOf(s.quat) as V3; for (let i = 0; i < 3; i++) fwd[i] += f[i]; }
     this.calEye = eye; this.calQuat = this.hold[n - 1].quat;
@@ -205,21 +247,38 @@ export class Engine {
   startTrial() {
     if (this.snap.phase !== 'game_intro' && this.snap.phase !== 'trial_end') return;
     this.countdownStart = performance.now();
-    this.emit({ phase: 'countdown', countdown: 3, trialEnd: null });
+    const practice = this.practicePending;
+    this.emit({ phase: 'countdown', countdown: 3, trialEnd: null, practice, practiceNext: false, trialSecNow: practice ? this.practiceLen() : this.cfg.trialSec, timeLeftS: practice ? this.practiceLen() : this.cfg.trialSec });
   }
+  /** Therapist choice on the game intro screen: go straight to the recorded trials. */
+  skipPractice() {
+    if (this.snap.phase !== 'game_intro' || !this.practicePending) return;
+    this.practicePending = false;
+    this.q('practice_skipped', 1, 'Therapist skipped the practice trial', this.gameName());
+    this.emit({ practiceNext: false });
+  }
+  private practiceLen() { return Math.min(this.cfg.trialSec, PRACTICE_SEC); }
+  /** Length of the trial being played right now (practice trials are shorter). */
+  private trialLen() { return this.inPractice ? this.practiceLen() : this.cfg.trialSec; }
+  /** Trial number to store in quality rows: practice trials have none. */
+  private trialRef(): number | null { return this.inPractice ? null : this.trialNo || null; }
   next() {
     if (this.snap.phase !== 'trial_end') return;
-    if (this.trialNo < this.cfg.trialsPerGame) { this.startTrial(); return; }
-    if (this.gameIdx < this.cfg.games.length - 1) { this.gameIdx++; this.trialNo = 0; this.toGameIntro(); return; }
-    this.finish(true);
+    // After the practice trial the recorded trials of the same game follow.
+    if (this.snap.practice) { this.startTrial(); return; }
+    this.slot++;
+    if (this.slot >= this.sched.length) { this.finish(true); return; }
+    const g = this.sched[this.slot];
+    if (g !== this.gameIdx) { this.gameIdx = g; this.trialNo = this.done[g]; this.toGameIntro(); return; }
+    this.startTrial();
   }
   setManualPause(on: boolean, why = 'Therapist') {
     if (this.snap.phase !== 'playing' && !(on === false)) return;
     if (on === this.manualPause) return;
     this.manualPause = on;
     const t = performance.now();
-    if (on) { this.pauseStart = t; this.q('pause', 1, why, this.gameName(), this.trialNo); }
-    else { const d = t - this.pauseStart; if (this.tq) this.tq.pauseMs += d; this.q('resume', Math.round(d), 'Resumed', this.gameName(), this.trialNo); this.resync(); }
+    if (on) { this.pauseStart = t; this.q('pause', 1, why, this.gameName(), this.trialRef()); }
+    else { const d = t - this.pauseStart; if (this.tq) this.tq.pauseMs += d; this.q('resume', Math.round(d), 'Resumed', this.gameName(), this.trialRef()); this.resync(); }
     this.emit({ manualPause: on });
   }
   /** Re-zero: the current hand position and heading become the new centre (the room of targets moves with it). */
@@ -231,7 +290,7 @@ export class Engine {
     this.filter.reset(); this.filt = null;
     // Targets already on screen are re-placed relative to the new centre by simply keeping their calibrated coordinates.
     if (this.tq) this.tq.recentres++;
-    this.q('recentre', 1, 'Centre reset', this.gameName(), this.trialNo || null);
+    this.q('recentre', 1, 'Centre reset', this.gameName(), this.trialRef());
     this.resync();
   }
   /** Ends the session early; whatever was recorded is kept and marked incomplete. */
@@ -244,7 +303,7 @@ export class Engine {
     return {
       phase: this.snap.phase, sub: this.sub, kind: this.kind, gms: this.gms,
       handCm: [this.cur.x * 100, this.cur.y * 100, this.cur.z * 100],
-      targets: list.map((t) => ({ posCm: t.pos.map((x) => x * 100), zone: t.zone, state: t.state, correct: it ? t === it.correct : true, label: t.opt?.label ?? '', ink: t.opt?.ink ?? '' })),
+      targets: list.map((t) => ({ posCm: t.pos.map((x) => x * 100), zone: t.zone, state: t.state, correct: it ? (it.multi ? t.state === 'idle' : t === it.correct) : true, ndc: t.ndc, sizeCm: t.size * 100, label: t.opt?.label ?? '', ink: t.opt?.ink ?? '' })),
       item: it ? { n: it.n, game: it.game, stimulus: it.stimulus } : null,
       touchRadiusCm: this.touchR * 100,
       cal: this.cal ? { c: this.cal.c, center: this.cal.center } : null,
@@ -264,14 +323,30 @@ export class Engine {
   }
 
   /* ---------------- helpers ---------------- */
-  private gameName() { const k = this.cfg.games[this.gameIdx]; return k ? (core.GAMES[k].name as string) : null; }
+  private gameName() { const k = this.order[this.gameIdx]; return k ? (core.GAMES[k].name as string) : null; }
   private q(event: string, value: number | null, detail: string, game?: string | null, trial?: number | null) {
     this.quality.push({ tMs: Math.max(0, Math.round(performance.now() - this.t0)), game: game ?? null, trial: trial ?? null, event, value: value == null ? null : round(value, 2), detail });
   }
   private curVec(): V3 { return [this.cur.x, this.cur.y, this.cur.z]; }
+  /**
+   * Where things can go: what the screen shows from `pose` (default: the phone right now), as a field of view plus a way to turn
+   * a point in camera space into the calibrated frame. Objects are placed in front of the camera, so they are on the screen.
+   */
+  private layoutView(pose?: { pos: V3; quat: Q4 } | null): { aspect: number; tanY: number; toCal: (p: number[]) => V3 } {
+    const p = pose ?? this.pose ?? { pos: this.calEye, quat: this.calQuat };
+    let tanY = Math.tan(FOV_Y / 2);
+    let aspect = this.size && this.size[1] > 0 ? this.size[0] / this.size[1] : 0.5;
+    const xr = this.sensor.xrCamera?.();
+    if (xr?.proj && xr.proj[5] > 0.01 && xr.proj[0] > 0.01) { tanY = 1 / xr.proj[5]; aspect = xr.proj[5] / xr.proj[0]; }
+    return {
+      aspect, tanY,
+      toCal: (pc: number[]) => core.toCalFrame(this.cal, core.v3.add(p.pos, core.quat.rotate(p.quat, pc))) as V3
+    };
+  }
   private resync() { if (this.item) { this.item.tracker.last = this.curVec(); this.item.tracker.lastT = this.gms; } this.lastKin = null; }
-  private mkTarget(pl: { pos: V3; az: number; el: number; zone: string; reachCm: number }, kind: ObjKind, opt: any): Target {
-    return { id: this.idSeq++, kind, pos: pl.pos, zone: pl.zone, az: pl.az, el: pl.el, reachCm: pl.reachCm, opt, state: 'idle', dwell: 0, enteredT: null, enteredP: null, stateT: 0, bornT: performance.now(), hot: false };
+  private mkTarget(pl: { pos: V3; az: number; el: number; zone: string; reachCm: number; size?: number; depthCm?: number; ndc?: [number, number] }, kind: ObjKind, opt: any): Target {
+    return { id: this.idSeq++, kind, pos: pl.pos, zone: pl.zone, az: pl.az, el: pl.el, reachCm: pl.reachCm,
+      size: pl.size ?? 0.07, depthCm: pl.depthCm ?? pl.reachCm, ndc: pl.ndc ?? [0, 0], variant: Math.floor(Math.random() * 6), opt, state: 'idle', dwell: 0, enteredT: null, enteredP: null, stateT: 0, bornT: performance.now(), hot: false };
   }
 
   /* ---------------- per-frame processing ---------------- */
@@ -298,15 +373,16 @@ export class Engine {
     const ev = this.health.tick(t);
     const phase = this.snap.phase;
     const hs = this.health.state as 'waiting' | 'ok' | 'lost';
-    if (ev === 'lost' && (phase === 'playing' || phase === 'range')) this.cue('lost');
-    if (ev === 'lost') this.q('tracking_lost', null, 'No valid tracking sample for 250 ms', this.gameName(), this.trialNo || null);
-    if (ev === 'restored' && this.lostPrev) this.q('tracking_restored', round(this.health.lostMs, 0), 'Tracking steady for 500 ms; total lost so far (ms)', this.gameName(), this.trialNo || null);
+    if (ev === 'lost' && (phase === 'playing' || phase === 'range')) { this.cue('lost'); haptic('lost'); }
+    if (ev === 'restored' && this.lostPrev && (phase === 'playing' || phase === 'range')) haptic('back');
+    if (ev === 'lost') this.q('tracking_lost', null, 'No valid tracking sample for 250 ms', this.gameName(), this.trialRef());
+    if (ev === 'restored' && this.lostPrev) this.q('tracking_restored', round(this.health.lostMs, 0), 'Tracking steady for 500 ms; total lost so far (ms)', this.gameName(), this.trialRef());
     this.lostPrev = hs === 'lost';
     if (this.cal && this.filt) { const c = core.toCalFrame(this.cal, this.filt) as V3; this.cur = { x: c[0], y: c[1], z: c[2] }; }
 
     const trackingOk = hs === 'ok';
     const paused = !trackingOk || this.manualPause;
-    if (phase === 'starting' && trackingOk) this.emit({ phase: 'cal_ready' });
+    if (phase === 'starting') this.tickInit(dt, fresh, trackingOk);
 
     switch (phase) {
       case 'cal_hold': this.tickHold(t, fresh, trackingOk); break;
@@ -314,17 +390,43 @@ export class Engine {
       case 'countdown': this.tickCountdown(t); break;
       case 'playing': if (!this.manualPause) this.tickPlay(t, dt, trackingOk); break;
     }
-    if (this.cal && (phase === 'range' || phase === 'playing') && !paused) this.logKin(t, trackingOk);
+    // Practice trials are not recorded: no movement rows either.
+    if (this.cal && (phase === 'range' || (phase === 'playing' && !this.inPractice)) && !paused) this.logKin(t, trackingOk);
 
     // Throttled snapshot for the HUD (5 Hz) so React does not re-render every frame.
     if (t - this.lastSnapT > 200 || hs !== this.snap.tracking) {
       this.lastSnapT = t;
-      const left = this.tq ? Math.max(0, this.cfg.trialSec - this.tq.activeMs / 1000) : this.cfg.trialSec;
+      const left = this.tq ? Math.max(0, this.trialLen() - this.tq.activeMs / 1000) : this.trialLen();
       const base: Partial<Snapshot> = { tracking: hs, rateHz: Math.round(this.sensor.rateHz()), timeLeftS: Math.ceil(left), score: this.score, elapsedS: Math.round((t - this.t0) / 1000) };
       if (phase === 'range') base.range = { index: this.rangeIdx, total: RANGE_DIRS.length, secLeft: Math.max(0, Math.ceil((RANGE_TIMEOUT_MS - (this.gms - this.rangeStartG)) / 1000)), results: this.rangeResults.slice() };
       this.emit(base);
     }
     this.render(hs);
+  }
+
+  /* ---------------- start-up movement ---------------- */
+  /**
+   * Position tracking needs a little parallax before it locks on, so (as in the paper) the participant first moves the
+   * phone back and forth for 5 s. Only real position tracking needs this; the clock runs while tracking is valid.
+   * The path travelled is logged so a session where the phone stayed still can be spotted afterwards.
+   */
+  private tickInit(dt: number, fresh: boolean, trackingOk: boolean) {
+    if (!trackingOk) return;
+    const need = this.cfg.mode === '6dof' ? INIT_MS : 0;
+    if (fresh && this.pose) {
+      if (this.initPrev) this.initPath += core.v3.dist(this.pose.pos, this.initPrev) as number;
+      this.initPrev = this.pose.pos.slice() as V3;
+    }
+    this.initMs += dt;
+    const progress = need ? Math.min(1, this.initMs / need) : 1;
+    if (Math.abs(progress - this.snap.init) > 0.03) this.emit({ init: progress });
+    if (progress >= 1) {
+      if (need) {
+        const cm = Math.round(this.initPath * 1000) / 10;
+        this.q('init_movement', cm, cm < 8 ? 'Start-up movement was small: the phone barely moved while tracking started' : 'Back-and-forth start-up movement (path, cm)', 'Start-up');
+      }
+      this.emit({ phase: 'cal_ready', init: 1 });
+    }
   }
 
   /* ---------------- calibration ---------------- */
@@ -344,8 +446,13 @@ export class Engine {
   /* ---------------- range check ---------------- */
   private startRangeDot() {
     const dir = RANGE_DIRS[this.rangeIdx];
-    const pos = core.rangePoint(this.kind, this.cfg.level, dir) as V3;
-    this.rangeTarget = this.mkTarget({ pos, az: 0, el: 0, zone: core.dirName(dir), reachCm: round(core.v3.len(pos) * 100, 1) ?? 0 }, 'dot', null);
+    // The four anchor dots are placed on the screen as seen from the calibration pose (right, up, left, down).
+    const view = this.layoutView({ pos: this.calEye, quat: this.calQuat });
+    const dist = this.cfg.distance ?? 'medium';
+    const pos = core.rangePoint(this.kind, this.cfg.level, dir, dist, view) as V3;
+    const d = this.kind === 'linear' ? (core.reachRadius('linear', this.cfg.level, dist) as number) : (core.AHEAD_ANGULAR_M as number);
+    const size = 2 * d * Math.tan((core.OBJ.dot.deg * core.DEG) / 2);
+    this.rangeTarget = this.mkTarget({ pos, az: 0, el: 0, zone: core.dirName(dir), reachCm: round(core.v3.len(pos) * 100, 1) ?? 0, size, depthCm: round(d * 100, 1) ?? 0, ndc: [0, 0] }, 'dot', null);
     this.rangeStartG = this.gms;
   }
   private tickRange(dt: number) {
@@ -359,16 +466,18 @@ export class Engine {
       this.rangeIdx++;
       if (this.rangeIdx >= RANGE_DIRS.length) { this.rangeTarget = null; this.toGameIntro(); } else this.startRangeDot();
     };
-    if (hit) { tg.state = 'correct'; tg.stateT = performance.now(); this.burst('ok', tg); this.cue('ok'); this.buzz(25); done(true); }
+    if (hit) { tg.state = 'correct'; tg.stateT = performance.now(); this.burst('ok', tg); this.cue('ok'); haptic('ok'); done(true); }
     else if (used >= RANGE_TIMEOUT_MS) done(false);
   }
 
   /* ---------------- games ---------------- */
   private toGameIntro() {
     this.rangeTarget = null;
-    this.item = null; this.tq = null; this.prevPl = null; this.prevKey = undefined; this.prevInk = undefined; this.prevZone = undefined;
-    const k = this.cfg.games[this.gameIdx];
-    this.emit({ phase: 'game_intro', game: k, gameIndex: this.gameIdx, trialNo: 0, prompt: null, range: { index: 0, total: RANGE_DIRS.length, secLeft: 0, results: this.rangeResults.slice() } });
+    this.item = null; this.tq = null; this.prevKey = undefined; this.prevInk = undefined; this.prevZone = undefined; this.prevSet = []; this.lastTri = null;
+    const k = this.order[this.gameIdx];
+    // One practice trial the first time each game comes up (never again if the games are mixed).
+    this.practicePending = !!this.cfg.practice && !this.seenGame.has(this.gameIdx); this.inPractice = false; this.seenGame.add(this.gameIdx);
+    this.emit({ phase: 'game_intro', game: k, gameIndex: this.gameIdx, slot: this.slot, trialNo: 0, practice: false, practiceNext: this.practicePending, trialSecNow: this.practicePending ? this.practiceLen() : this.cfg.trialSec, prompt: null, range: { index: 0, total: RANGE_DIRS.length, secLeft: 0, results: this.rangeResults.slice() } });
   }
 
   private tickCountdown(t: number) {
@@ -380,15 +489,19 @@ export class Engine {
   private homePrompt() { return this.cfg.homeGate ? { caption: 'Return to the ring', main: '' } : { caption: 'Get ready', main: '' }; }
 
   private beginTrial(t: number) {
-    this.cue('go');
-    this.trialNo++; this.score = 0; this.itemCount = 0; this.item = null; this.sub = 'home'; this.homeHold = 0;
-    const key = this.cfg.games[this.gameIdx];
+    this.cue('go'); haptic('go');
+    // The first trial of a game is the practice trial when it is switched on. It is played like any other but never stored.
+    this.inPractice = this.practicePending; this.practicePending = false;
+    if (this.inPractice) this.practiceEvents = []; else { this.done[this.gameIdx]++; this.trialNo = this.done[this.gameIdx]; }
+    this.score = 0; this.itemCount = 0; this.item = null; this.sub = 'home'; this.homeHold = 0;
+    const key = this.order[this.gameIdx];
     this.tq = {
       activeMs: 0, pauseMs: 0, recentres: 0, min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity],
       lost0: this.health.lostMsAt(t), drop0: this.health.dropouts, valid0: this.health.validSamples
     };
-    this.q('trial_start', this.trialNo, `${core.GAMES[key].name} trial ${this.trialNo}`, core.GAMES[key].name, this.trialNo);
-    this.emit({ phase: 'playing', game: key, gameIndex: this.gameIdx, trialNo: this.trialNo, score: 0, itemNo: 0, timeLeftS: this.cfg.trialSec, prompt: this.homePrompt(), countdown: 0, trialEnd: null });
+    if (this.inPractice) this.q('practice_start', this.practiceLen(), `${core.GAMES[key].name} practice trial (not recorded)`, core.GAMES[key].name);
+    else this.q('trial_start', this.trialNo, `${core.GAMES[key].name} trial ${this.trialNo}`, core.GAMES[key].name, this.trialNo);
+    this.emit({ phase: 'playing', game: key, gameIndex: this.gameIdx, slot: this.slot, trialNo: this.trialNo, practice: this.inPractice, practiceNext: false, trialSecNow: this.trialLen(), score: 0, itemNo: 0, timeLeftS: this.trialLen(), prompt: this.homePrompt(), countdown: 0, trialEnd: null });
   }
 
   private tickPlay(t: number, dt: number, trackingOk: boolean) {
@@ -398,7 +511,7 @@ export class Engine {
     const c = this.curVec();
     for (let i = 0; i < 3; i++) { this.tq.min[i] = Math.min(this.tq.min[i], c[i]); this.tq.max[i] = Math.max(this.tq.max[i], c[i]); }
 
-    if (this.tq.activeMs >= this.cfg.trialSec * 1000) { this.endTrial(t); return; }
+    if (this.tq.activeMs >= this.trialLen() * 1000) { this.endTrial(t); return; }
 
     if (this.sub === 'home') {
       const inside = !this.cfg.homeGate || Math.hypot(c[0], c[1], c[2]) <= HOME_R;
@@ -421,7 +534,7 @@ export class Engine {
 
   /** Dwell logic with a little hysteresis so a tremor at the edge does not restart the hold. */
   private updateDwell(targets: Target[], dt: number): Target | null {
-    let touched: Target | null = null;
+    let touched: Target | null = null; let touchedD = Infinity;
     const c = this.curVec();
     for (const tg of targets) {
       if (tg.state !== 'idle') { tg.hot = false; continue; }
@@ -429,26 +542,40 @@ export class Engine {
       const inside = d <= (tg.enteredT != null ? this.touchR * 1.25 : this.touchR);
       tg.hot = d <= this.touchR;
       if (inside) {
-        if (tg.enteredT == null) { tg.enteredT = this.gms; tg.enteredP = c; tg.dwell = 0; }
+        if (tg.enteredT == null) { tg.enteredT = this.gms; tg.enteredP = c; tg.dwell = 0; haptic('tick'); }
         tg.dwell += dt;
-        if (tg.dwell >= this.cfg.dwellMs && !touched) touched = tg;
+        // If two touch zones overlap, the object whose centre is nearest wins.
+        if (tg.dwell >= this.cfg.dwellMs && d < touchedD) { touched = tg; touchedD = d; }
       } else { tg.enteredT = null; tg.enteredP = null; tg.dwell = 0; }
     }
     return touched;
   }
 
   private spawnItem() {
-    const key = this.cfg.games[this.gameIdx];
+    const key = this.order[this.gameIdx];
+    const view = this.layoutView();
     let data: any = null; let targets: Target[]; let stimulus: string; let correct: Target; let correctAnswer = ''; let condition: string; let optionsText: string;
     let prompt: { caption: string; main: string };
-    if (key === 'triangle') {
-      const pl = this.placer.next(this.prevPl); this.prevPl = pl;
-      correct = this.mkTarget(pl, 'tri', null); targets = [correct];
-      stimulus = 'triangle'; condition = pl.zone; optionsText = `triangle@${pl.zone}`;
-      prompt = { caption: GAME_TEXT.triangle.caption, main: '' };
+    const multi = key === 'triangle';
+    if (multi) {
+      // Triangle Reach: a set of triangles floating in front of the phone, all on the screen, far apart. Touch them all.
+      const n = core.objectCount('triangle', this.cfg.level) as number;
+      // New triangles keep clear of where the hand is now and of the previous set, so each reach is a real movement in a new direction.
+      const avoid: { p: V3; r: number; hard?: boolean }[] = this.prevSet.map((p) => ({ p, r: 0.08 }));
+      if (this.lastTri) avoid.push({ p: this.lastTri, r: 0.14, hard: true });
+      if (this.kind === 'linear') avoid.push({ p: this.curVec(), r: 0.14, hard: true });
+      const pls = this.placer.place(view, Array(n).fill('tri'), { band: false, avoid }) as any[];
+      targets = pls.map((pl) => this.mkTarget(pl, 'tri', null));
+      this.prevSet = targets.map((t) => t.pos);
+      correct = targets[0];
+      stimulus = 'triangles'; condition = `set of ${n}`; optionsText = targets.map((t) => `triangle@${t.zone}`).join('; ');
+      prompt = { caption: `Touch the ${n} triangles`, main: '' };
     } else {
-      data = key === 'maths' ? this.source.maths(this.placer, this.prevKey, this.prevZone) : this.source.colour(this.placer, this.prevInk, this.prevZone);
-      targets = data.options.map((o: any) => this.mkTarget(o, key === 'maths' ? 'num' : 'word', o));
+      data = key === 'maths' ? this.source.maths(this.prevKey) : this.source.colour(this.prevInk);
+      const kinds = data.options.map(() => (key === 'maths' ? 'num' : 'word'));
+      const pls = this.placer.place(view, kinds, { band: true }) as any[];
+      const opts = core.layoutOptions(this.rng, pls, data.options, this.prevZone) as any[];
+      targets = opts.map((o: any) => this.mkTarget(o, key === 'maths' ? 'num' : 'word', o));
       correct = targets.find((t) => t.opt.correct) as Target;
       this.prevKey = data.key; this.prevInk = key === 'colour' ? data.targetInk : undefined; this.prevZone = correct.zone;
       stimulus = data.stimulus; condition = data.condition;
@@ -460,7 +587,7 @@ export class Engine {
     this.item = {
       n: this.itemCount, game: key, data, targets, onsetWall: performance.now() - this.t0, onsetGame: this.gms,
       tracker: new core.ReachTracker(this.gms, this.curVec()), start: this.curVec(), errors: 0, firstResponse: null,
-      stimulus, optionsText, correct, correctAnswer, condition, closed: false
+      stimulus, optionsText, correct, correctAnswer, condition, closed: false, multi, setSize: targets.length, touched: 0
     };
     this.sub = 'reach';
     for (const tg of targets) this.burst('ping', tg);
@@ -468,6 +595,7 @@ export class Engine {
   }
 
   private onTouch(it: Item, tg: Target) {
+    if (it.multi) { this.onTouchTriangle(it, tg); return; }
     const label = it.game === 'colour' ? tg.opt.ink : tg.opt ? tg.opt.label : 'triangle';
     if (it.firstResponse == null) it.firstResponse = String(label);
     if (tg === it.correct) {
@@ -475,34 +603,71 @@ export class Engine {
       this.burst('ok', tg, '+1'); this.cue('ok');
       const confirmG = this.gms;
       this.closeItem('correct', tg.enteredT ?? confirmG, tg.enteredP ?? this.curVec(), confirmG);
-      this.score++; this.buzz(30);
+      this.score++; haptic('ok');
       for (const o of it.targets) if (o !== tg && o.state === 'idle') o.state = 'disabled';
       this.sub = 'feedback'; this.feedbackUntil = this.gms + FEEDBACK_OK_MS;
       this.emit({ score: this.score, prompt: { caption: 'Good!', main: '' } });
     } else {
-      tg.state = 'wrong'; tg.stateT = performance.now(); it.errors++; this.burst('bad', tg); this.cue('bad'); this.buzz([40, 40, 40]);
+      tg.state = 'wrong'; tg.stateT = performance.now(); it.errors++; this.burst('bad', tg); this.cue('bad'); haptic('bad');
       // a wrong target stays wrong (cannot be re-touched) so repeated hovering does not count twice
+    }
+  }
+
+  /** Triangle Reach: every triangle is a target. Each one touched is a row of its own, timed from the previous touch. */
+  private onTouchTriangle(it: Item, tg: Target) {
+    tg.state = 'correct'; tg.stateT = performance.now();
+    this.burst('ok', tg, '+1'); this.cue('ok'); haptic('ok');
+    const confirmG = this.gms;
+    const fin = it.tracker.finish(tg.enteredT ?? confirmG, tg.enteredP ?? this.curVec(), confirmG);
+    it.touched++;
+    this.lastTri = tg.pos;
+    it.firstResponse = 'triangle';
+    this.recordEvent(it, tg, 'correct', fin, it.touched);
+    this.score++;
+    const left = it.targets.filter((t) => t.state === 'idle').length;
+    if (left === 0) {
+      haptic('set');
+      it.closed = true;
+      this.sub = 'feedback'; this.feedbackUntil = this.gms + FEEDBACK_OK_MS;
+      this.emit({ score: this.score, prompt: { caption: 'Good!', main: '' } });
+    } else {
+      // next reach starts where this one ended
+      it.tracker = new core.ReachTracker(this.gms, this.curVec());
+      it.start = this.curVec(); it.onsetGame = this.gms; it.onsetWall = performance.now() - this.t0;
+      this.itemCount++; it.n = this.itemCount;
+      this.emit({ score: this.score, itemNo: this.itemCount, prompt: { caption: left === 1 ? 'One more triangle' : `${left} triangles to go`, main: '' } });
     }
   }
 
   private closeItem(outcome: 'correct' | 'timeout' | 'trial_end', entryG?: number, entryP?: V3, confirmG?: number) {
     const it = this.item; if (!it || it.closed) return;
+    let c = it.correct;
+    if (it.multi) {
+      // A set cut short by the clock or a timeout: log the triangle that was nearest, nothing else.
+      const idle = it.targets.filter((t) => t.state === 'idle');
+      if (!idle.length) { it.closed = true; return; }
+      c = idle.reduce((a, b) => (core.v3.dist(it.start, a.pos) <= core.v3.dist(it.start, b.pos) ? a : b));
+    }
     it.closed = true;
     const fin = outcome === 'correct' ? it.tracker.finish(entryG, entryP, confirmG) : null;
-    const c = it.correct;
-    this.events.push({
+    this.recordEvent(it, c, outcome, fin, null);
+  }
+
+  private recordEvent(it: Item, c: Target, outcome: 'correct' | 'timeout' | 'trial_end', fin: any, setOrder: number | null) {
+    (this.inPractice ? this.practiceEvents : this.events).push({
       game: it.game, trial: this.trialNo, item: it.n, onsetMs: Math.max(0, Math.round(it.onsetWall)), stimulus: it.stimulus, options: it.optionsText,
       zone: c.zone, targetX: round(c.pos[0] * 100, 1), targetY: round(c.pos[1] * 100, 1), targetZ: round(c.pos[2] * 100, 1), targetAz: c.az, targetEl: c.el, targetReachCm: c.reachCm,
       startToTargetCm: round(core.v3.dist(it.start, c.pos) * 100, 1), correctAnswer: it.correctAnswer || null,
       firstResponse: it.firstResponse, outcome, firstTry: outcome === 'correct' ? (it.errors === 0 ? 1 : 0) : (it.errors > 0 ? 0 : null), errorsBefore: it.errors,
       rtMs: fin?.rtMs ?? null, mtMs: fin?.mtMs ?? null, respMs: fin?.respMs ?? null, pathCm: fin?.pathCm ?? null, straightCm: fin?.straightCm ?? null,
-      pathEff: fin?.pathEff ?? null, peakSpeedCms: fin?.peakSpeedCms ?? null, condition: it.condition
+      pathEff: fin?.pathEff ?? null, peakSpeedCms: fin?.peakSpeedCms ?? null, condition: it.condition,
+      setSize: it.setSize, setOrder, screenX: c.ndc[0], screenY: c.ndc[1], depthCm: c.depthCm, sizeCm: round(c.size * 100, 1)
     });
   }
 
   private endTrial(t: number) {
     if (this.item && !this.item.closed) this.closeItem('trial_end');
-    const tq = this.tq; const key = this.cfg.games[this.gameIdx];
+    const tq = this.tq; const key = this.order[this.gameIdx];
     const lost = this.health.lostMsAt(t) - tq.lost0;
     const wall = tq.activeMs + lost;
     const validN = this.health.validSamples - tq.valid0;
@@ -511,24 +676,31 @@ export class Engine {
       rateHz: wall > 0 ? round(validN / (wall / 1000), 1) ?? 0 : 0,
       dropouts: this.health.dropouts - tq.drop0, lostMs: Math.round(lost), recentres: tq.recentres
     };
-    const has = isFinite(tq.min[0]);
-    const trial = {
-      game: key, trial: this.trialNo, level: this.cfg.level, activeMs: Math.round(tq.activeMs), pauseMs: Math.round(tq.pauseMs), score: this.score,
-      rom: has ? { h: round((tq.max[0] - tq.min[0]) * 100, 1) ?? 0, v: round((tq.max[1] - tq.min[1]) * 100, 1) ?? 0, ...(this.kind === 'linear' ? { d: round((tq.max[2] - tq.min[2]) * 100, 1) ?? 0 } : {}) } : null, quality
-    };
-    this.trials.push(trial);
-    this.q('trial_end', this.score, `score ${this.score}`, core.GAMES[key].name, this.trialNo);
-    const evs = this.events.filter((e) => e.game === key && e.trial === this.trialNo);
+    const practice = this.inPractice;
+    if (!practice) {
+      const has = isFinite(tq.min[0]);
+      const trial = {
+        game: key, trial: this.trialNo, seq: this.slot + 1, level: this.cfg.level, activeMs: Math.round(tq.activeMs), pauseMs: Math.round(tq.pauseMs), score: this.score,
+        rom: has ? { h: round((tq.max[0] - tq.min[0]) * 100, 1) ?? 0, v: round((tq.max[1] - tq.min[1]) * 100, 1) ?? 0, ...(this.kind === 'linear' ? { d: round((tq.max[2] - tq.min[2]) * 100, 1) ?? 0 } : {}) } : null, quality
+      };
+      this.trials.push(trial);
+      this.q('trial_end', this.score, `score ${this.score}`, core.GAMES[key].name, this.trialNo);
+    } else {
+      this.q('practice_end', this.score, `${core.GAMES[key].name} practice finished; not recorded`, core.GAMES[key].name);
+    }
+    const evs = practice ? this.practiceEvents : this.events.filter((e) => e.game === key && e.trial === this.trialNo);
     const done = evs.filter((e) => e.outcome === 'correct');
     const errors = evs.reduce((s, e) => s + (e.errorsBefore || 0), 0);
     const info: TrialEnd = {
-      game: key, trial: this.trialNo, score: this.score, correct: done.length, errors, misses: evs.filter((e) => e.outcome === 'timeout').length,
+      game: key, trial: this.trialNo, practice, score: this.score, correct: done.length, errors, misses: evs.filter((e) => e.outcome === 'timeout').length,
       accuracyPct: done.length + errors ? round((100 * done.length) / (done.length + errors), 0) : null,
       rtMeanMs: round(core.mean(done.map((e) => e.rtMs)), 0), validPct: quality.validPct, dropouts: quality.dropouts
     };
-    this.item = null; this.sub = 'home'; this.tq = null;
-    const last = this.trialNo >= this.cfg.trialsPerGame && this.gameIdx >= this.cfg.games.length - 1;
-    this.emit({ phase: 'trial_end', trialEnd: info, isLast: last, prompt: null, timeLeftS: this.cfg.trialSec, manualPause: false });
+    this.item = null; this.sub = 'home'; this.tq = null; this.inPractice = false;
+    const last = !practice && this.slot >= this.sched.length - 1;
+    const ng = practice ? this.gameIdx : !last ? this.sched[this.slot + 1] : null;
+    haptic('end');
+    this.emit({ phase: 'trial_end', trialEnd: info, isLast: last, nextGame: ng == null ? null : this.order[ng], nextNewGame: ng != null && ng !== this.gameIdx, prompt: null, timeLeftS: this.cfg.trialSec, trialSecNow: this.cfg.trialSec, practice, manualPause: false });
     this.manualPause = false;
   }
 
@@ -536,7 +708,7 @@ export class Engine {
     if (this.ended) return;
     if (this.snap.phase === 'playing' && this.tq) this.endTrial(performance.now());
     this.ended = true;
-    this.completeFlag = complete && this.trials.length === this.cfg.games.length * this.cfg.trialsPerGame;
+    this.completeFlag = complete && this.trials.length === this.sched.length;
     this.endedAt = new Date().toISOString();
     this.cue('end');
     this.emit({ phase: 'finished', prompt: null });
@@ -568,22 +740,21 @@ export class Engine {
   }
 
   /** The finished session as the server expects it, plus the 20 Hz rows (uploaded separately). */
-  result(extra?: { adverse?: string; notes?: string; questionnaire?: Record<string, string | number> }): { record: SessionInput; kin: any[][] } {
+  result(extra?: { adverse?: string; adverseTags?: string[]; notes?: string; questionnaire?: Record<string, string | number> }): { record: SessionInput; kin: any[][] } {
     const c = this.calResult;
     const record: any = {
       id: uuid(), participantId: this.cfg.participantId, sessionNo: this.cfg.sessionNo, group: this.cfg.group, therapist: this.cfg.therapist,
-      affectedSide: this.cfg.affectedSide, handMode: this.cfg.handMode, mode: this.cfg.mode, level: this.cfg.level, games: this.cfg.games,
+      affectedSide: this.cfg.affectedSide, handMode: this.cfg.handMode, mode: this.cfg.mode, level: this.cfg.level, games: this.order, orderMode: this.orderMode, sequence: this.trials.map((t) => t.game),
       trialsPerGame: this.cfg.trialsPerGame, trialSec: this.cfg.trialSec, dwellMs: this.cfg.dwellMs, itemTimeoutSec: this.cfg.itemTimeoutSec,
-      camera: this.cfg.camera, homeGate: this.cfg.homeGate, device: this.cfg.device, seed: this.cfg.seed, appVersion: core.VERSION,
+      camera: this.cfg.camera, homeGate: this.cfg.homeGate, practice: !!this.cfg.practice, distance: this.cfg.distance ?? 'medium', objectSize: this.cfg.objectSize ?? 'medium', device: this.cfg.device, seed: this.cfg.seed, appVersion: core.VERSION,
       tzOffsetMin: -new Date().getTimezoneOffset(), startedAt: this.startedAt, endedAt: this.endedAt || new Date().toISOString(), complete: this.completeFlag,
-      adverse: extra?.adverse || '', notes: extra?.notes || '',
+      briefed: this.cfg.briefed, adverseTags: extra?.adverseTags ?? [], adverse: extra?.adverse || '', notes: extra?.notes || '',
       calibration: c ? { rateHz: round(c.rateHz, 1), jitterCm: round(c.jitterCm, 2) ?? 0, pass: c.pass, override: this.calOverride, attempts: Math.max(1, this.calAttempts), range: this.rangeResults } : null,
       trials: this.trials, events: this.events, quality: this.quality, questionnaire: extra?.questionnaire ?? null, kinRows: this.kin.length
     };
     return { record, kin: this.kin };
   }
 
-  private buzz(p: number | number[]) { try { navigator.vibrate?.(p); } catch { /* not supported (iPhone) */ } }
   private burst(kind: 'ok' | 'bad' | 'ping', tg: Target, text?: string) {
     if (!this.cal) return;
     this.view?.burst(kind, core.calToWorld(this.cal, tg.pos) as V3, text);
@@ -606,7 +777,7 @@ export class Engine {
     const objects: ViewObj[] = [];
     const toObj = (tg: Target): ViewObj => ({
       id: tg.id, kind: tg.kind, pos: core.calToWorld(this.cal, tg.pos) as V3, label: tg.opt ? tg.opt.label : undefined, ink: tg.opt?.inkHex,
-      state: tg.state, progress: tg.state === 'idle' ? Math.min(1, tg.dwell / this.cfg.dwellMs) : 0, hot: tg.hot, touchR: this.touchR, bornMs: tg.bornT, stateMs: tg.stateT
+      state: tg.state, progress: tg.state === 'idle' ? Math.min(1, tg.dwell / this.cfg.dwellMs) : 0, hot: tg.hot, touchR: this.touchR, bornMs: tg.bornT, stateMs: tg.stateT, size: tg.size, variant: tg.variant
     });
     let best = 0; let anyHot = false;
     if (this.cal) {

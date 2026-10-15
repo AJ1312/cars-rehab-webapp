@@ -8,9 +8,10 @@ export interface Staff {
   active: boolean; createdAt: string; lastLoginAt: string | null;
 }
 
+/** A study phone. It registers itself the first time it uploads; staff can remove it, which stops it for good. */
 export interface Device {
-  id: string; label: string; model: string | null; createdAt: string; enrolledAt: string | null;
-  lastSeenAt: string | null; revokedAt: string | null; pending: boolean; enrolExpiresAt: string | null;
+  id: string; label: string; model: string | null; createdAt: string; registeredAt: string | null;
+  lastSeenAt: string | null; revokedAt: string | null;
 }
 
 export interface SessionSummary {
@@ -24,7 +25,15 @@ export interface SessionRow {
   mode: string; level: number; group: string | null; therapist: string | null; complete: boolean;
   calPass: boolean | null; calOverride: boolean | null; deviceId: string | null; deviceLabel: string | null;
   flags: string[]; summary: SessionSummary; kinRows: number; receivedAt: string; appVersion: string | null;
+  /** Optional name the study team gave the session in the admin board. */
+  title: string | null;
 }
+
+/** A note a staff member wrote on one session. */
+export interface SessionComment { id: string; sessionId: string; author: string; body: string; createdAt: string }
+
+/** What staff may change on a stored session. The record inside is updated to match, so exports agree with the screen. */
+export interface SessionPatch { participantCode?: string; sessionNo?: number; group?: string; therapist?: string; notes?: string; title?: string | null; flags?: string[] }
 export interface SessionFull extends SessionRow { record: SessionInput; hasKin: boolean }
 
 export interface AuditEntry { id: number; at: string; actor: string; action: string; target: string | null; detail: unknown; ip: string | null }
@@ -43,14 +52,24 @@ export interface Store {
   createStaff(s: Omit<Staff, 'id' | 'createdAt' | 'lastLoginAt' | 'failedAttempts' | 'lockedUntil'>): Promise<Staff>;
   updateStaff(id: string, patch: Partial<Staff>): Promise<void>;
 
-  createEnrolment(a: { label: string; codeHash: string; expiresAt: string; createdBy: string | null }): Promise<Device>;
-  redeemEnrolment(codeHash: string, tokenHash: string, model: string | null): Promise<Device | null>;
+  registerDevice(a: { label: string; tokenHash: string; model: string | null }): Promise<Device>;
+  /** Also returns removed phones (revokedAt set), so a removed phone can be told apart from an unknown token. */
   deviceByTokenHash(hash: string): Promise<Device | null>;
   touchDevice(id: string): Promise<void>;
   listDevices(): Promise<Device[]>;
   revokeDevice(id: string): Promise<void>;
 
   upsertSession(s: SessionFull): Promise<{ created: boolean }>;
+  updateSession(id: string, patch: SessionPatch): Promise<void>;
+  /** Removes the session, its movement file and its comments, and remembers the id so a phone that still has it does not upload it again. */
+  deleteSession(id: string): Promise<void>;
+  wasDeleted(id: string): Promise<boolean>;
+  listComments(sessionId: string): Promise<SessionComment[]>;
+  commentCounts(): Promise<Record<string, number>>;
+  commentsFor(sessionIds: string[]): Promise<SessionComment[]>;
+  addComment(a: { sessionId: string; author: string; body: string }): Promise<SessionComment>;
+  getComment(id: string): Promise<SessionComment | null>;
+  deleteComment(id: string): Promise<void>;
   getSession(id: string): Promise<SessionFull | null>;
   listSessions(q?: SessionQuery): Promise<SessionRow[]>;
   countSessions(q?: SessionQuery): Promise<number>;

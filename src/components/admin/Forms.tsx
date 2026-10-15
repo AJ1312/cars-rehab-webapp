@@ -1,31 +1,9 @@
 'use client';
 import { useActionState, useState } from 'react';
-import { changePasswordAction, createEnrolmentAction, createStaffAction, resetStaffAction, saveSettingsAction, type ActionState } from '@/app/admin/(board)/actions';
+import { addCommentAction, changePasswordAction, createStaffAction, deleteParticipantAction, deleteSessionAction, editSessionAction, renameParticipantAction, resetStaffAction, saveSettingsAction, type ActionState } from '@/app/admin/(board)/actions';
 import type { Settings } from '@/lib/schema';
 
 const init: ActionState = {};
-
-export function EnrolDeviceForm() {
-  const [s, act, pending] = useActionState(createEnrolmentAction, init);
-  return (
-    <div className="panel">
-      <h2>Enrol a new phone</h2>
-      <form action={act} className="form">
-        <div className="field"><label htmlFor="lab">Phone name</label><input id="lab" name="label" className="input" placeholder="Study phone 1" maxLength={40} required /><span className="hint">Shown in the data next to every session from this phone.</span></div>
-        <button className="btn primary" disabled={pending}>{pending ? 'Creating…' : 'Create QR code'}</button>
-      </form>
-      {s.error && <p className="error-msg" role="alert">{s.error}</p>}
-      {s.ok && s.qr && (
-        <div className="form" role="status">
-          <p><b>{s.label}</b> — open the camera on that phone and scan this code, or type the code on the Enrol page. It works once and expires in 24 hours.</p>
-          <div className="qr"><img src={s.qr} alt={`QR code to enrol ${s.label}`} width={280} height={280} /></div>
-          <div className="code-big">{s.code}</div>
-          <p className="small muted" style={{ overflowWrap: 'anywhere' }}>{s.url}</p>
-        </div>
-      )}
-    </div>
-  );
-}
 
 export function StaffForm() {
   const [s, act, pending] = useActionState(createStaffAction, init);
@@ -71,7 +49,7 @@ export function SettingsForm({ v }: { v: Settings }) {
         <div className="field"><label htmlFor="a5">Default reach level</label><select id="a5" className="input" name="level" defaultValue={v.level}><option value={1}>1 · 20 cm</option><option value={2}>2 · 30 cm</option><option value={3}>3 · 40 cm</option></select></div>
         <div className="field"><label htmlFor="a6">Study groups (comma separated)</label><input id="a6" className="input" name="groups" defaultValue={v.groups.join(', ')} /></div>
       </div>
-      <p className="hint muted">These are the starting values on every enrolled phone. Therapists can still change them for a single session, and the values used are always written into the data sheet.</p>
+      <p className="hint muted">These are the starting values on every study phone. Therapists can still change them for a single session, and the values used are always written into the data sheet.</p>
       {s.error && <p className="error-msg" role="alert">{s.error}</p>}
       {s.ok && <p className="chip ok" role="status">{s.message}</p>}
       <button className="btn primary" disabled={pending}>{pending ? 'Saving…' : 'Save defaults'}</button>
@@ -127,5 +105,86 @@ export function TotpPanel({ enabled }: { enabled: boolean }) {
         </>
       )}
     </div>
+  );
+}
+
+
+/* ---------- manage one session ---------- */
+export function EditSessionForm({ id, v, canDelete, groups }: { id: string; v: { participantCode: string; sessionNo: number; group: string; therapist: string; title: string; notes: string }; canDelete: boolean; groups: string[] }) {
+  const [s, act, pending] = useActionState(editSessionAction, init);
+  const [d, delAct, delPending] = useActionState(deleteSessionAction, init);
+  const gs = [...new Set([...groups, v.group])];
+  return (
+    <section className="panel" id="manage">
+      <h2>Edit this session</h2>
+      <p className="sub">Fix a wrong participant code, session number or group, give the session a title, or add notes. The measured data is never changed. Every edit is written to the audit log.</p>
+      <form action={act} className="form">
+        <input type="hidden" name="id" value={id} />
+        <div className="grid2">
+          <div className="field"><label htmlFor="e-p">Participant ID</label><input id="e-p" name="participantCode" className="input" defaultValue={v.participantCode} required maxLength={20} autoCapitalize="characters" autoComplete="off" /></div>
+          <div className="field"><label htmlFor="e-n">Session number</label><input id="e-n" name="sessionNo" type="number" min={1} max={999} className="input" defaultValue={v.sessionNo} required /></div>
+          <div className="field"><label htmlFor="e-g">Group</label><select id="e-g" name="group" className="input" defaultValue={v.group}>{gs.map((g) => <option key={g}>{g}</option>)}</select></div>
+          <div className="field"><label htmlFor="e-t">Therapist initials</label><input id="e-t" name="therapist" className="input" defaultValue={v.therapist} maxLength={10} autoComplete="off" /></div>
+        </div>
+        <div className="field"><label htmlFor="e-ti">Title</label><input id="e-ti" name="title" className="input" defaultValue={v.title} maxLength={60} placeholder="e.g. Baseline, or Pilot run" autoComplete="off" /><span className="hint">Shown at the top of this page and in the Excel sheet.</span></div>
+        <div className="field"><label htmlFor="e-no">Notes</label><textarea id="e-no" name="notes" className="input" rows={3} defaultValue={v.notes} maxLength={2000} /></div>
+        <button className="btn primary" disabled={pending}>{pending ? 'Saving…' : 'Save changes'}</button>
+        {s.error && <p className="error-msg" role="alert">{s.error}</p>}
+        {s.ok && s.message && <p className="ok-msg" role="status">{s.message}</p>}
+      </form>
+      {canDelete && (
+        <details className="danger-zone">
+          <summary>Delete this session</summary>
+          <form action={delAct} className="form">
+            <input type="hidden" name="id" value={id} />
+            <p>This removes the session, its movement recording and its comments from the study for good. A phone that still holds the session will not upload it again. Export it first if you may need it.</p>
+            <div className="field"><label htmlFor="d-c">Type DELETE to confirm</label><input id="d-c" name="confirm" className="input" autoComplete="off" autoCapitalize="characters" required /></div>
+            <button className="btn danger" disabled={delPending}>{delPending ? 'Deleting…' : 'Delete session'}</button>
+            {d.error && <p className="error-msg" role="alert">{d.error}</p>}
+          </form>
+        </details>
+      )}
+    </section>
+  );
+}
+
+export function CommentForm({ id }: { id: string }) {
+  const [s, act, pending] = useActionState(addCommentAction, init);
+  return (
+    <form action={act} className="form comment-form">
+      <input type="hidden" name="id" value={id} />
+      <div className="field"><label htmlFor="c-b">Add a comment</label><textarea id="c-b" name="body" className="input" rows={3} maxLength={2000} placeholder="e.g. Participant tired after trial 3; phone slipped on the strap." required /></div>
+      <button className="btn primary" disabled={pending}>{pending ? 'Adding…' : 'Add comment'}</button>
+      {s.error && <p className="error-msg" role="alert">{s.error}</p>}
+    </form>
+  );
+}
+
+/* ---------- manage one participant ---------- */
+export function ParticipantManage({ code, canDelete, sessions }: { code: string; canDelete: boolean; sessions: number }) {
+  const [r, rAct, rPending] = useActionState(renameParticipantAction, init);
+  const [d, dAct, dPending] = useActionState(deleteParticipantAction, init);
+  return (
+    <section className="panel">
+      <h2>Manage this participant</h2>
+      <form action={rAct} className="form">
+        <input type="hidden" name="from" value={code} />
+        <div className="field"><label htmlFor="r-t">Rename participant ID</label><input id="r-t" name="to" className="input" defaultValue={code} maxLength={20} required autoCapitalize="characters" autoComplete="off" /><span className="hint">Changes the ID on all {sessions} session{sessions === 1 ? '' : 's'} and in every export. It cannot merge into an ID that already uses one of the same session numbers.</span></div>
+        <button className="btn" disabled={rPending}>{rPending ? 'Renaming…' : 'Rename'}</button>
+        {r.error && <p className="error-msg" role="alert">{r.error}</p>}
+      </form>
+      {canDelete && (
+        <details className="danger-zone">
+          <summary>Delete this participant</summary>
+          <form action={dAct} className="form">
+            <input type="hidden" name="code" value={code} />
+            <p>Deletes all {sessions} session{sessions === 1 ? '' : 's'} of {code}, with their movement recordings and comments, for good. Export first if you may need them.</p>
+            <div className="field"><label htmlFor="pd-c">Type DELETE to confirm</label><input id="pd-c" name="confirm" className="input" autoComplete="off" autoCapitalize="characters" required /></div>
+            <button className="btn danger" disabled={dPending}>{dPending ? 'Deleting…' : `Delete ${code}`}</button>
+            {d.error && <p className="error-msg" role="alert">{d.error}</p>}
+          </form>
+        </details>
+      )}
+    </section>
   );
 }

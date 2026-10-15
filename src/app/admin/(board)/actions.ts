@@ -1,32 +1,71 @@
 'use server';
 import { headers } from 'next/headers';
 import { revalidatePath } from 'next/cache';
+import { redirect } from 'next/navigation';
 import { z } from 'zod';
 import { requireStaff } from '@/lib/server/auth';
+import { addComment, editSession, removeComment, removeParticipant, removeSession, renameParticipant, type Result } from '@/lib/server/manage';
 import { hashPassword, verifyPassword } from '@/lib/server/crypto';
-import { createEnrolment, revokeDevice } from '@/lib/server/devices';
+import { revokeDevice } from '@/lib/server/devices';
 import { getStore } from '@/lib/server/store';
 import { settingsSchema } from '@/lib/schema';
 
-export interface ActionState { ok?: boolean; error?: string; code?: string; url?: string; qr?: string; expires?: string; label?: string; message?: string }
+export interface ActionState { ok?: boolean; error?: string; message?: string }
 
-async function origin() {
-  const h = await headers();
-  const host = h.get('x-forwarded-host') || h.get('host') || 'localhost:3000';
-  const proto = h.get('x-forwarded-proto') || (host.startsWith('localhost') ? 'http' : 'https');
-  return `${proto}://${host}`;
-}
+const toState = (r: Result): ActionState => (r.ok ? { ok: true, message: r.message } : { error: r.error });
 const ipOf = async () => ((await headers()).get('x-forwarded-for') || '').split(',')[0].trim() || null;
 
-export async function createEnrolmentAction(_: ActionState, fd: FormData): Promise<ActionState> {
-  const staff = await requireStaff('admin');
-  const label = z.string().trim().min(2, 'Give the phone a name, e.g. "Study phone 1"').max(40).safeParse(fd.get('label'));
-  if (!label.success) return { error: label.error.issues[0].message };
-  const r = await createEnrolment(staff, label.data, await origin(), await ipOf());
-  revalidatePath('/admin/devices');
-  return { ok: true, code: r.code, url: r.url, label: label.data, expires: r.expires, qr: r.qr };
-}
+/* ---------- sessions and participants: edit, delete, comment ---------- */
+const id36 = z.string().uuid();
+const typedDelete = (fd: FormData) => String(fd.get('confirm') || '').trim().toUpperCase() === 'DELETE';
 
+export async function editSessionAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  const staff = await requireStaff('researcher');
+  const id = id36.safeParse(fd.get('id')); if (!id.success) return { error: 'Unknown session' };
+  const r = await editSession(staff, id.data, Object.fromEntries(fd), await ipOf());
+  revalidatePath('/admin', 'layout');
+  if (r.ok) redirect(`/admin/sessions/${id.data}?saved=1`);
+  return toState(r);
+}
+export async function deleteSessionAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  const staff = await requireStaff('admin');
+  const id = id36.safeParse(fd.get('id')); if (!id.success) return { error: 'Unknown session' };
+  if (!typedDelete(fd)) return { error: 'Type DELETE to confirm' };
+  const r = await removeSession(staff, id.data, await ipOf());
+  revalidatePath('/admin', 'layout');
+  if (r.ok && r.goto) redirect(r.goto);
+  return toState(r);
+}
+export async function renameParticipantAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  const staff = await requireStaff('researcher');
+  const from = String(fd.get('from') || '').toUpperCase();
+  const r = await renameParticipant(staff, from, String(fd.get('to') || ''), await ipOf());
+  revalidatePath('/admin', 'layout');
+  if (r.ok && r.goto) redirect(r.goto);
+  return toState(r);
+}
+export async function deleteParticipantAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  const staff = await requireStaff('admin');
+  if (!typedDelete(fd)) return { error: 'Type DELETE to confirm' };
+  const r = await removeParticipant(staff, String(fd.get('code') || '').toUpperCase(), await ipOf());
+  revalidatePath('/admin', 'layout');
+  if (r.ok && r.goto) redirect(r.goto);
+  return toState(r);
+}
+export async function addCommentAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  const staff = await requireStaff();
+  const id = id36.safeParse(fd.get('id')); if (!id.success) return { error: 'Unknown session' };
+  const r = await addComment(staff, id.data, String(fd.get('body') || ''), await ipOf());
+  revalidatePath(`/admin/sessions/${id.data}`);
+  return toState(r);
+}
+export async function deleteCommentAction(fd: FormData) {
+  const staff = await requireStaff();
+  const id = id36.safeParse(fd.get('id')); const sid = id36.safeParse(fd.get('session'));
+  if (!id.success || !sid.success) return;
+  await removeComment(staff, id.data, await ipOf());
+  revalidatePath(`/admin/sessions/${sid.data}`);
+}
 export async function revokeDeviceAction(fd: FormData) {
   const staff = await requireStaff('admin');
   await revokeDevice(staff, z.string().uuid().parse(fd.get('id')), await ipOf());

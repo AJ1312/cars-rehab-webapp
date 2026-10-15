@@ -4,12 +4,15 @@ import { Engine, gameInfo, type SessionConfig, type Snapshot } from '@/lib/clien
 import { createSensor } from '@/lib/client/sensors';
 import { isMuted, setMuted, sfx, sfxUnlock } from '@/lib/client/sfx';
 import { GameGlyph } from '@/components/ui/Glyphs';
+import { IconVibrate } from '@/components/ui/Art';
+import { hapticsKind, isHapticsOn, setHapticsOn } from '@/lib/client/haptics';
 import type { StoredSession } from '@/lib/client/local';
 
 const IDLE: Snapshot = {
   phase: 'idle', error: null, tracking: 'waiting', rateHz: 0, manualPause: false, cal: { progress: 0, result: null, attempts: 0 },
   range: { index: 0, total: 4, secLeft: 0, results: [] }, game: null, gameIndex: 0, gameCount: 0, trialNo: 0, trialsTotal: 0, timeLeftS: 0, score: 0, itemNo: 0,
-  prompt: null, countdown: 0, trialEnd: null, isLast: false, elapsedS: 0
+  prompt: null, countdown: 0, trialEnd: null, isLast: false, elapsedS: 0, init: 0, practice: false, practiceNext: false, trialSecNow: 0,
+  slot: 0, slots: 0, nextGame: null, nextNewGame: false
 };
 const noopSub = () => () => undefined;
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
@@ -32,13 +35,15 @@ export function StageScreen({ cfg, onFinished, onExit }: { cfg: SessionConfig; o
   const [engine, setEngine] = useState<Engine | null>(null);
   const [confirmEnd, setConfirmEnd] = useState(false);
   const [mute, setMute] = useState(false);
+  const [vib, setVib] = useState(true);
+  const hk = hapticsKind();
   const [camState, setCamState] = useState<'off' | 'wait' | 'live' | 'denied'>('off');
   const doneRef = useRef(false);
   const snap = useSyncExternalStore(engine ? engine.subscribe : noopSub, engine ? engine.getSnapshot : () => IDLE, () => IDLE);
   const xr = cfg.mode === '6dof';
   const linear = xr || cfg.mode === 'sim';
 
-  useEffect(() => { setMute(isMuted()); }, []);
+  useEffect(() => { setMute(isMuted()); setVib(isHapticsOn()); }, []);
   useEffect(() => {
     document.documentElement.classList.add('in-stage');
     return () => document.documentElement.classList.remove('in-stage');
@@ -113,7 +118,8 @@ export function StageScreen({ cfg, onFinished, onExit }: { cfg: SessionConfig; o
   const info = snap.game ? gameInfo(snap.game, cfg.mode) : null;
   const lost = snap.tracking === 'lost' && (ph === 'playing' || ph === 'range');
   const te = snap.trialEnd;
-  const nextGame = snap.gameIndex < cfg.games.length - 1 ? gameInfo(cfg.games[snap.gameIndex + 1]).name : null;
+  const nextGame = snap.nextGame ? gameInfo(snap.nextGame).name : null;
+  const mixed = cfg.order === 'mixed';
   const showSheet = !confirmEnd && !snap.manualPause && (ph === 'idle' || ph === 'cal_ready' || ph === 'cal_result' || ph === 'game_intro' || ph === 'trial_end');
   const modeTag = xr ? 'AR position tracking' : cfg.mode === 'motion' ? 'Motion tracking' : cfg.mode === 'touch' ? 'Touch practice' : 'Simulated hand';
   const inTrial = ph === 'playing' || ph === 'countdown' || ph === 'trial_end';
@@ -134,12 +140,12 @@ export function StageScreen({ cfg, onFinished, onExit }: { cfg: SessionConfig; o
           {ph === 'range' ? <b className="sm">{Math.min(snap.range.index + 1, snap.range.total)}/{snap.range.total}</b> : <b key={snap.score} className={snap.score ? 'pop' : ''}>{snap.score}</b>}
         </div>
         <div className="hud-c">
-          {info && ph !== 'idle' && <span className="game-tag">{info.name}{inTrial && snap.trialNo > 0 && <span className="pips" aria-label={`Trial ${snap.trialNo} of ${snap.trialsTotal}`}>{pips.map((n) => <i key={n} className={n < snap.trialNo || (n === snap.trialNo && ph === 'trial_end') ? 'done' : n === snap.trialNo ? 'now' : ''} />)}</span>}</span>}
+          {info && ph !== 'idle' && <span className="game-tag">{info.name}{inTrial && snap.practice && <span className="prac-tag">Practice</span>}{inTrial && !snap.practice && snap.trialNo > 0 && <span className="pips" aria-label={`Trial ${snap.trialNo} of ${snap.trialsTotal}`}>{pips.map((n) => <i key={n} className={n < snap.trialNo || (n === snap.trialNo && ph === 'trial_end') ? 'done' : n === snap.trialNo ? 'now' : ''} />)}</span>}</span>}
         </div>
         <div className={'chip-s time' + (low ? ' low' : '')}>
           <small>{ph === 'range' ? 'Seconds' : 'Time'}</small>
-          <b>{ph === 'range' ? snap.range.secLeft : fmt(playing || ph === 'trial_end' ? snap.timeLeftS : cfg.trialSec)}</b>
-          {playing && <span className="bar" style={{ width: `${Math.max(0, Math.min(100, (snap.timeLeftS / cfg.trialSec) * 100))}%` }} />}
+          <b>{ph === 'range' ? snap.range.secLeft : fmt(playing || ph === 'trial_end' ? snap.timeLeftS : snap.trialSecNow || cfg.trialSec)}</b>
+          {playing && <span className="bar" style={{ width: `${Math.max(0, Math.min(100, (snap.timeLeftS / (snap.trialSecNow || cfg.trialSec)) * 100))}%` }} />}
         </div>
       </div>
 
@@ -156,7 +162,16 @@ export function StageScreen({ cfg, onFinished, onExit }: { cfg: SessionConfig; o
         </div>
       )}
       {ph === 'starting' && (
-        <div className="mid" role="status" aria-live="polite"><span className="cap">Finding tracking</span><div className="main" style={{ fontSize: 'clamp(24px, 7vw, 34px)' }}>Move the phone slowly</div></div>
+        <div className="mid" role="status" aria-live="polite">
+          {xr && snap.tracking === 'ok' && (
+            <div className="cal-ring" style={{ background: 'var(--s-ink)', borderRadius: '50%', border: '3px solid var(--s-paper)' }}>
+              <svg viewBox="0 0 120 120" aria-hidden="true"><circle cx="60" cy="60" r="48" fill="none" stroke="rgba(246,241,231,.25)" strokeWidth="9" /><circle cx="60" cy="60" r="48" fill="none" stroke="#FFC400" strokeWidth="9" strokeLinecap="round" strokeDasharray={2 * Math.PI * 48} strokeDashoffset={2 * Math.PI * 48 * (1 - snap.init)} transform="rotate(-90 60 60)" /></svg>
+              <b style={{ color: '#F6F1E7' }}>{Math.max(0, Math.ceil(5 * (1 - snap.init)))}</b>
+            </div>
+          )}
+          <span className="cap">{xr ? (snap.tracking === 'ok' ? 'Starting AR tracking' : 'Finding tracking') : 'Finding tracking'}</span>
+          <div className="main" style={{ fontSize: 'clamp(24px, 7vw, 34px)' }}>{xr ? 'Move the phone back and forth' : 'Move the phone slowly'}</div>
+        </div>
       )}
       {ph === 'cal_hold' && (
         <div className="mid" role="status" aria-live="polite">
@@ -171,10 +186,11 @@ export function StageScreen({ cfg, onFinished, onExit }: { cfg: SessionConfig; o
 
       <div className="bar-b">
         <span className={'pill-s ' + (snap.tracking === 'ok' ? '' : snap.tracking === 'lost' ? 'lost' : 'wait')} role="status">
-          {snap.tracking === 'ok' ? `Tracking · ${snap.rateHz} Hz` : snap.tracking === 'lost' ? 'Tracking lost' : ph === 'idle' ? 'Not started' : 'Finding tracking…'}
+          {snap.tracking === 'ok' ? `${snap.rateHz} Hz` : snap.tracking === 'lost' ? 'Lost' : ph === 'idle' ? 'Idle' : 'Finding…'}
         </span>
         <div className="tools">
           <button className="tool" aria-label={mute ? 'Turn sound on' : 'Turn sound off'} aria-pressed={mute} onClick={() => { sfxUnlock(); const m = !mute; setMuted(m); setMute(m); if (!m) sfx('back'); }}>{mute ? I.muted : I.sound}<span>{mute ? 'Muted' : 'Sound'}</span></button>
+          {hk !== 'none' && <button className="tool" aria-label={vib ? 'Turn vibration off' : 'Turn vibration on'} aria-pressed={!vib} onClick={() => { const v = !vib; setHapticsOn(v); setVib(v); }}><IconVibrate /><span>{vib ? 'Buzz' : 'No buzz'}</span></button>}
           {ph === 'range' && <button className="tool" onClick={() => engine?.skipRange()}>{I.skip}<span>Skip</span></button>}
           {(playing || ph === 'range') && <button className="tool" onClick={() => engine?.recentre()}>{I.recentre}<span>Centre</span></button>}
           {playing && <button className="tool" onClick={() => engine?.setManualPause(true)}>{I.pause}<span>Pause</span></button>}
@@ -234,28 +250,33 @@ export function StageScreen({ cfg, onFinished, onExit }: { cfg: SessionConfig; o
 
       {showSheet && ph === 'game_intro' && info && snap.game && (
         <div className="sheet" role="dialog" aria-label={info.name}>
-          <span className="tag">Game {snap.gameIndex + 1} of {snap.gameCount}</span>
+          <span className="tag">{mixed ? `Trial ${snap.slot + 1} of ${snap.slots}` : `Game ${snap.gameIndex + 1} of ${snap.gameCount}`}</span>
           <h2>{info.name}</h2>
           <div className="how"><GameGlyph g={snap.game} /><p>{info.how}</p></div>
-          <p className="small">{cfg.trialsPerGame} {cfg.trialsPerGame === 1 ? 'trial' : 'trials'} of {cfg.trialSec} seconds. The clock pauses if tracking is lost.</p>
-          <div className="btns"><button className="sbtn go" onClick={() => engine?.startTrial()}>Start trial 1</button><button className="sbtn" onClick={() => setConfirmEnd(true)}>End session</button></div>
+          <p className="small">{snap.practiceNext ? `First a practice trial of up to ${snap.trialSecNow} seconds that is not recorded, then ` : ''}{mixed ? `one trial of ${cfg.trialSec} seconds. The three games are mixed, so the next one may be different.` : `${cfg.trialsPerGame} ${cfg.trialsPerGame === 1 ? 'trial' : 'trials'} of ${cfg.trialSec} seconds.`} The clock pauses if tracking is lost.</p>
+          <div className="btns">
+            <button className="sbtn go" onClick={() => engine?.startTrial()}>{snap.practiceNext ? 'Start practice' : mixed ? 'Start trial' : 'Start trial 1'}</button>
+            {snap.practiceNext && <button className="sbtn" onClick={() => engine?.skipPractice()}>Skip practice</button>}
+            <button className="sbtn" onClick={() => setConfirmEnd(true)}>End session</button>
+          </div>
         </div>
       )}
 
       {showSheet && ph === 'trial_end' && te && (
         <div className="sheet" role="dialog" aria-label="Trial finished">
-          <span className="tag">{gameInfo(te.game).name} · trial {te.trial} of {cfg.trialsPerGame}</span>
-          <h2>{snap.isLast ? 'All done!' : 'Trial complete'}</h2>
+          <span className="tag">{gameInfo(te.game).name} · {te.practice ? 'practice' : `trial ${te.trial} of ${cfg.trialsPerGame}`}</span>
+          <h2>{te.practice ? 'Practice done' : snap.isLast ? 'All done!' : 'Trial complete'}</h2>
           <div className="stats">
             <div className="stat"><b>{te.score}</b><span>Score</span></div>
             <div className="stat"><b>{te.accuracyPct == null ? '–' : te.accuracyPct + '%'}</b><span>Accuracy</span></div>
             <div className="stat"><b>{te.rtMeanMs == null ? '–' : (te.rtMeanMs / 1000).toFixed(2) + ' s'}</b><span>Reaction</span></div>
           </div>
           {te.dropouts > 0 && <p className="fail">Tracking was lost {te.dropouts} time{te.dropouts > 1 ? 's' : ''} in this trial. The clock was paused each time.</p>}
-          <p className="small">Rest your arm before the next one if needed.</p>
+          {!te.practice && <p className="small">Session progress: trial {snap.slot + 1} of {snap.slots}.</p>}
+          <p className="small">{te.practice ? 'The practice trial is not saved or scored. Rest your arm, then start the first real trial.' : 'Rest your arm before the next one if needed.'}</p>
           <div className="btns">
             <button className="sbtn go" onClick={() => engine?.next()}>
-              {snap.isLast ? 'Finish session' : te.trial < cfg.trialsPerGame ? `Start trial ${te.trial + 1}` : `Next game: ${nextGame}`}
+              {te.practice ? (mixed ? 'Start trial' : 'Start trial 1') : snap.isLast ? 'Finish session' : snap.nextNewGame ? `Next: ${nextGame}` : `Start trial ${te.trial + 1}`}
             </button>
             {!snap.isLast && <button className="sbtn" onClick={() => setConfirmEnd(true)}>End session</button>}
           </div>

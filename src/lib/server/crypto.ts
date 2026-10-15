@@ -26,16 +26,6 @@ export const DUMMY_HASH = 'scrypt$16384$8$1$AAAAAAAAAAAAAAAAAAAAAA==$' + Buffer.
 
 export function randomToken(prefix: string, bytes = 32) { return prefix + randomBytes(bytes).toString('base64url'); }
 
-// Enrolment codes avoid look-alike characters (0/O, 1/I/L).
-const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-export function enrolCode(): string {
-  const b = randomBytes(8);
-  let s = '';
-  for (let i = 0; i < 8; i++) s += ALPHABET[b[i] % ALPHABET.length];
-  return s.slice(0, 4) + '-' + s.slice(4);
-}
-export const normaliseCode = (c: string) => c.toUpperCase().replace(/[^A-Z0-9]/g, '');
-
 /* ---- TOTP (RFC 6238, SHA-1, 6 digits, 30 s) ---- */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 export function base32(buf: Buffer): string {

@@ -17,7 +17,7 @@ export default async function Quality() {
   const modes = new Map<string, number>(); rows.forEach((r) => modes.set(r.mode, (modes.get(r.mode) || 0) + 1));
   const clean = rows.filter((r) => r.flags.length === 0).length;
   const problem = rows.filter((r) => r.flags.some((f) => FLAG_INFO[f]?.severity === 'bad' || f === 'kin_missing'));
-  const perDevice = devices.filter((d) => d.enrolledAt).map((d) => {
+  const perDevice = devices.map((d) => {
     const s = rows.filter((r) => r.deviceId === d.id);
     return { d, n: s.length, valid: avg(s.map((x) => x.summary.validPctMean)), jitter: avg(s.map((x) => x.summary.calJitterCm)), rate: avg(s.map((x) => x.summary.calRateHz)), flagged: s.filter((x) => x.flags.length).length, last: s.length ? s[0].receivedAt : null };
   });
@@ -40,7 +40,7 @@ export default async function Quality() {
           )}
         </section>
         <section className="panel"><h2>By phone</h2>
-          {perDevice.length === 0 ? <p className="muted">No enrolled phones yet.</p> : (
+          {perDevice.length === 0 ? <p className="muted">No phones have uploaded yet.</p> : (
             <div className="table-wrap"><table><thead><tr><th>Phone</th><th className="r">Sessions</th><th className="r">Tracking %</th><th className="r">Jitter cm</th><th className="r">Rate Hz</th><th className="r">Flagged</th><th>Last upload</th></tr></thead><tbody>
               {perDevice.map((x) => <tr key={x.d.id}><td>{x.d.label}{x.d.revokedAt ? ' (revoked)' : ''}</td><td className="r">{x.n}</td><td className="r">{n1(x.valid, 0)}</td><td className="r">{n1(x.jitter, 2)}</td><td className="r">{n1(x.rate, 0)}</td><td className="r">{x.flagged}</td><td>{ago(x.last)}</td></tr>)}
             </tbody></table></div>

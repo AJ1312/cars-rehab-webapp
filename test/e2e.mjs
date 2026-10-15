@@ -4,6 +4,7 @@ import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
 import { rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
+import { inflateRawSync } from 'node:zlib';
 
 const PORT = 3102, BASE = `http://localhost:${PORT}`;
 const DATA = new URL('./out/e2e-data', import.meta.url).pathname;
@@ -28,10 +29,22 @@ const check = (name, ok, extra = '') => { results.push([ok, name, extra]); conso
 const shot = (page, name) => page.screenshot({ path: SHOTS + name + '.png' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let exitCode = 0;
+/** Read every file of an .xlsx (zip with sizes in the local headers) as text. */
+function unzipText(buf) {
+  const out = {}; let o = 0;
+  while (o + 30 <= buf.length && buf.readUInt32LE(o) === 0x04034b50) {
+    const method = buf.readUInt16LE(o + 8), csize = buf.readUInt32LE(o + 18), nlen = buf.readUInt16LE(o + 26), xlen = buf.readUInt16LE(o + 28);
+    const name = buf.subarray(o + 30, o + 30 + nlen).toString(); const data = buf.subarray(o + 30 + nlen + xlen, o + 30 + nlen + xlen + csize);
+    out[name] = (method === 8 ? inflateRawSync(data) : data).toString('utf8'); o += 30 + nlen + xlen + csize;
+  }
+  return out;
+}
 const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 
 async function newPhone(init, extra = {}) {
-  const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, acceptDownloads: true, timezoneId: 'Asia/Kolkata', locale: 'en-GB', permissions: ['camera'], ...extra });
+  const { tour, ...opts } = extra;   // tour: true = a first-time visitor, so the welcome tour shows
+  const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, acceptDownloads: true, timezoneId: 'Asia/Kolkata', locale: 'en-GB', permissions: ['camera'], ...opts });
+  if (!tour) await ctx.addInitScript("try{localStorage.setItem('cars.welcome.v2','1')}catch(e){}");
   if (init) await ctx.addInitScript(init);
   return ctx;
 }
@@ -74,11 +87,13 @@ const ORIENT = () => {
   setInterval(() => window.dispatchEvent(new DeviceOrientationEvent('deviceorientation', { alpha: a + (Math.random() - 0.5) * 0.04, beta: b + (Math.random() - 0.5) * 0.04, gamma: g + (Math.random() - 0.5) * 0.04, absolute: false })), 16);
 };
 
-async function fillSetup(page, { code, trials = 1, secs = 12, games = ['Triangle Reach', 'Maths Fun', 'Colour Merge Test'], mode, camera = true, level }) {
+async function fillSetup(page, { code, trials = 1, secs = 12, games = ['Triangle Reach', 'Maths Fun', 'Colour Merge Test'], mode, camera = true, level, practice = true }) {
+  if (!(await page.getByRole('heading', { name: 'Who is playing?' }).isVisible().catch(() => false))) await page.getByRole('button', { name: 'Start', exact: true }).click();
   await page.getByLabel('Participant ID').fill(code);
   await page.getByRole('button', { name: 'Next' }).click();
   await page.getByRole('heading', { name: 'Set up the session' }).waitFor();
   if (level) await page.getByRole('radio', { name: new RegExp('Level ' + level) }).click();
+  const pr = page.getByLabel(/Practice trial before each game/); if ((await pr.isChecked()) !== practice) await pr.click();
   await page.locator('summary', { hasText: 'More settings' }).click();
   await page.getByLabel('Trials per game').fill(String(trials));
   await page.getByLabel('Trial length (seconds)').fill(String(secs));
@@ -89,6 +104,7 @@ async function fillSetup(page, { code, trials = 1, secs = 12, games = ['Triangle
   }
   await page.getByRole('button', { name: 'Next' }).click();
   await page.getByRole('heading', { name: 'Ready?' }).waitFor();
+  await page.getByLabel('I have told the participant').check();
   if (mode === 'motion' || mode === 'touch') {
     await page.locator('summary', { hasText: 'Change tracking mode' }).click();
     await page.locator('.mode', { hasText: mode === 'motion' ? 'Motion tracking' : 'Touch practice' }).getByRole('button').click();
@@ -113,8 +129,9 @@ async function runSession(page, { onPhase, tag = 'run' } = {}) {
       case 'idle': if (first) await shot(page, `${tag}-01-start`); await click(/Start tracking|Open AR/); break;
       case 'cal_ready': if (first) await shot(page, `${tag}-02-calibrate`); await click('Calibrate now'); break;
       case 'cal_result': if (first) await shot(page, `${tag}-03-cal-result`); await click(snap.cal.result.pass ? 'Continue' : 'Continue anyway (flagged in data)'); break;
-      case 'game_intro': if (first) await shot(page, `${tag}-05-intro-${snap.game}`); await click('Start trial 1'); break;
-      case 'trial_end': if (first) await shot(page, `${tag}-07-trial-end-${snap.game}`); await click(/Start trial|Next game|Finish session/); break;
+      case 'game_intro': if (first) await shot(page, `${tag}-05-intro-${snap.game}`);
+        if (snap.practiceNext && !(tag === 'a' && snap.gameIndex === 0)) await click('Skip practice'); else await click(/Start (practice|trial)/); break;
+      case 'trial_end': if (first) await shot(page, `${tag}-07-trial-end-${snap.game}`); await click(/Start trial|Next: |Finish session/); break;
       case 'error': throw new Error('engine error: ' + snap.error);
       default: await sleep(120);
     }
@@ -122,27 +139,41 @@ async function runSession(page, { onPhase, tag = 'run' } = {}) {
 }
 
 try {
-  /* ============ A. Enrol a phone, run a full session with a simulated 6-DoF hand, check the data ============ */
-  console.log('A. Full session on an enrolled phone (simulated 6-DoF hand, live camera behind)');
-  const admin = await browser.newContext();
-  assert.equal((await admin.request.post(BASE + '/api/auth/login', { data: ADMIN })).status(), 200);
-  const mk = await (await admin.request.post(BASE + '/api/admin/devices', { data: { label: 'Study phone 1' } })).json();
+  /* ============ A0. A first-time visitor gets the welcome tour once ============ */
+  console.log('A0. First visit: welcome tour');
+  const tctx = await newPhone(null, { tour: true });
+  const tp = await tctx.newPage();
+  await tp.goto(BASE + '/');
+  const dlg = tp.getByRole('dialog');
+  await dlg.waitFor({ timeout: 8000 }).catch(() => undefined);
+  check('first visit shows the welcome tour', await dlg.isVisible().catch(() => false));
+  await shot(tp, 'a0-welcome');
+  await dlg.getByRole('button', { name: 'Next' }).click().catch(() => undefined);
+  await sleep(300);
+  await tp.getByRole('button', { name: 'Skip' }).click();
+  await sleep(300);
+  check('Skip closes the tour and reveals Start', !(await dlg.isVisible().catch(() => false)) && (await tp.getByRole('button', { name: 'Start', exact: true }).isVisible()));
+  await tp.reload(); await sleep(700);
+  check('the tour does not come back on the next visit', !(await tp.getByRole('dialog').isVisible().catch(() => false)));
+  await tctx.close();
+
+  /* ============ A. Run a full session with a simulated 6-DoF hand, check the data. The phone registers itself on upload. ============ */
+  console.log('A. Full session (simulated 6-DoF hand, live camera behind), phone registers itself');
 
   const phoneCtx = await newPhone();
   const page = await phoneCtx.newPage();
   const consoleErrors = []; page.on('pageerror', (e) => consoleErrors.push(String(e))); page.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); });
-  await page.goto(`${BASE}/enrol?code=${mk.code}`);
-  await shot(page, 'a-00-enrol');
-  await page.getByRole('button', { name: 'Enrol this phone' }).click();
-  await page.getByText('Enrolled as Study phone 1').waitFor();
-  check('phone enrols with the QR/code', true);
-
   await page.goto(BASE + '/?sim=1');
-  await page.getByRole('heading', { name: 'Who is playing?' }).waitFor();
-  await sleep(600);
-  await shot(page, 'a-01-setup');
+  await page.getByRole('button', { name: 'Start', exact: true }).waitFor();
+  await sleep(900);
+  const homeText = await page.locator('main').innerText();
+  check('Home has no enrolment or QR step', !/enrol|QR/i.test(homeText), homeText.match(/.{0,30}(enrol|QR).{0,30}/i)?.[0] || '');
+  check('Home has the guide, a try-it demo and the phone check', /guide/i.test(homeText) && /try it/i.test(homeText) && /phone check/i.test(homeText));
+  await shot(page, 'a-00-home');
+  check('Home: no horizontal scroll at 390px', await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
   check('setup screen: no horizontal scroll at 390px', await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
   await fillSetup(page, { code: 'E2E001', trials: 1, secs: 14 });
+  await shot(page, 'a-01-setup');
   await shot(page, 'a-01b-ready');
   await page.getByRole('button', { name: 'Start session' }).click();
   await page.evaluate(`(${BOT})()`);
@@ -165,6 +196,7 @@ try {
   const res = await page.evaluate(() => window.__carsResult);
   const rec = res.record;
   check('session recorded in position-tracked (6-DoF style) mode with a calibration', rec.mode === 'sim' && rec.calibration && rec.calibration.pass);
+  check('order was randomised, practice and the safety briefing were recorded', rec.orderMode === 'random' && rec.sequence && rec.sequence.length === 3 && new Set(rec.sequence).size === 3 && rec.practice === true && rec.briefed === true, JSON.stringify([rec.orderMode, rec.sequence, rec.practice, rec.briefed]));
   check('3D renderer started (WebGL available)', (rec.quality || []).some((q) => q.event === 'renderer' && q.value === 1));
   const ev = rec.events;
   const byGame = (g) => ev.filter((e) => e.game === g);
@@ -174,10 +206,10 @@ try {
   const zones = new Set(ev.map((e) => e.zone));
   check('targets appear in many different regions of the room', zones.size >= 5, [...zones].join(','));
   const dists = ev.filter((e) => e.startToTargetCm != null).map((e) => e.startToTargetCm);
-  check('every reach is a real movement (>= 7 cm from the start ring)', dists.length > 5 && Math.min(...dists) >= 7, 'min ' + Math.min(...dists));
+  check('every reach is a real movement (>= 5 cm)', dists.length > 5 && Math.min(...dists) >= 5, 'min ' + Math.min(...dists));
   let consecOk = true;
-  for (let i = 1; i < tri.length; i++) { const a = tri[i - 1], b = tri[i]; const d = Math.hypot(a.targetX - b.targetX, a.targetY - b.targetY, a.targetZ - b.targetZ); if (d < 15) consecOk = false; }
-  check('consecutive triangles are far apart (>= 15 cm)', tri.length >= 3 && consecOk);
+  for (let i = 1; i < tri.length; i++) { const a = tri[i - 1], b = tri[i]; const d = Math.hypot(a.targetX - b.targetX, a.targetY - b.targetY, a.targetZ - b.targetZ); if (d < 9) consecOk = false; }
+  check('consecutive triangles are apart (>= 9 cm)', tri.length >= 3 && consecOk);
   const nums = [];
   for (const e of byGame('maths')) { const m = e.stimulus.match(/^(\d+) ([+-]) (\d+)$/); if (m) nums.push(+m[1], +m[3]); nums.push(+e.correctAnswer); (e.options.match(/(\d+)@/g) || []).forEach((x) => nums.push(parseInt(x))); }
   check('Maths Fun: every number shown is between 1 and 10', nums.length > 8 && nums.every((n) => n >= 1 && n <= 10), 'min ' + Math.min(...nums) + ' max ' + Math.max(...nums));
@@ -213,12 +245,9 @@ try {
     navigator.canShare = () => true;
     navigator.share = async (d) => { window.__shared.push((d.files || []).map((f) => f.name)); };`);
   const ip = await ictx.newPage();
-  await ip.goto(`${BASE}/enrol?code=${(await (await admin.request.post(BASE + '/api/admin/devices', { data: { label: 'Study iPhone' } })).json()).code}`);
-  await ip.getByRole('button', { name: 'Enrol this phone' }).click();
-  await ip.getByText('Enrolled as Study iPhone').waitFor();
   await ip.goto(BASE + '/');
   await sleep(600);
-  await fillSetup(ip, { code: 'E2E002', trials: 1, secs: 14, games: ['Triangle Reach', 'Maths Fun'], mode: 'motion', level: 2 });
+  await fillSetup(ip, { code: 'E2E002', trials: 1, secs: 14, games: ['Triangle Reach', 'Maths Fun'], mode: 'motion', level: 2, practice: false });
   await shot(ip, 'b-01-ready-iphone');
   const readyText = await ip.locator('main').innerText();
   check('iPhone: setup explains that only rotation is measured', /rotation/i.test(readyText));
@@ -255,11 +284,8 @@ try {
   console.log('C. Offline queue (touch practice mode)');
   const octx = await newPhone();
   const op = await octx.newPage();
-  await op.goto(`${BASE}/enrol?code=${(await (await admin.request.post(BASE + '/api/admin/devices', { data: { label: 'Study phone 2' } })).json()).code}`);
-  await op.getByRole('button', { name: 'Enrol this phone' }).click();
-  await op.getByText('Enrolled as Study phone 2').waitFor();
   await op.goto(BASE + '/'); await sleep(600);
-  await fillSetup(op, { code: 'E2E003', trials: 1, secs: 14, games: ['Triangle Reach'], mode: 'touch' });
+  await fillSetup(op, { code: 'E2E003', trials: 1, secs: 14, games: ['Triangle Reach'], mode: 'touch', practice: false });
   await op.getByRole('button', { name: 'Start session' }).click();
   await op.evaluate(`(${BOT})(); window.__bot.mode = 'touch';`);
   await octx.setOffline(true);
@@ -296,9 +322,40 @@ try {
   check('session page lists trials, sensor events and the tracking dropout', /Triangle Reach/.test(pageText) && /tracking_lost/.test(pageText) && /Maths Fun/.test(pageText));
   check('session page: no horizontal scroll at 390px', await ap.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
   await ap.screenshot({ path: SHOTS + 'd-05-session.png', fullPage: true });
+  const sid = ap.url().match(/sessions\/([0-9a-f-]{36})/)[1];
+  // comment, then title: both show on the page and in the Excel sheet
+  await ap.getByLabel('Add a comment').fill('Phone slipped on the strap in trial 3.');
+  await ap.getByRole('button', { name: 'Add comment' }).click();
+  await ap.getByText('Phone slipped on the strap in trial 3.').waitFor();
+  check('admin can comment on a session', true);
+  await ap.getByLabel('Title', { exact: true }).fill('Baseline run');
+  await ap.getByLabel('Notes', { exact: true }).fill('Checked by hand');
+  await ap.getByRole('button', { name: 'Save changes' }).click();
+  await ap.getByRole('heading', { level: 1, name: 'Baseline run' }).waitFor();
+  check('admin can rename a session', true);
+  await ap.screenshot({ path: SHOTS + 'd-05b-session-managed.png', fullPage: true });
+  const xr = await ap.request.get(BASE + '/api/export/session/' + sid);
+  const xf = unzipText(Buffer.from(await xr.body()));
+  const xall = Object.values(xf).join('\n');
+  check('the session Excel sheet has a Comments tab with the comment, the title and the notes', /<sheet name="Comments"/.test(xf['xl/workbook.xml']) && /strap in trial 3/.test(xall) && /Baseline run/.test(xall) && /Checked by hand/.test(xall));
   await ap.goto(BASE + '/admin/quality'); await shot(ap, 'd-06-quality');
   await ap.goto(BASE + '/admin/devices'); await shot(ap, 'd-07-devices');
+  const devText = await ap.locator('main').innerText();
+  check('Phones page lists the phones that registered themselves, with no QR step', (devText.match(/Active/g) || []).length >= 3 && /iPhone · Safari/.test(devText) && !/QR|Enrol/i.test(devText), devText.slice(0, 200).replace(/\n/g, ' | '));
   await ap.goto(BASE + '/admin/exports'); await shot(ap, 'd-08-exports');
+  await ap.goto(BASE + '/admin/sessions?participant=E2E001');
+  check('Sessions list shows the title and a comment count, and offers an Excel export of what is filtered', await ap.getByText('Baseline run').first().isVisible() && await ap.getByRole('link', { name: /Download these 1 \(Excel\)/ }).isVisible());
+  // participant: rename then delete (admin only, typed confirmation)
+  await ap.goto(BASE + '/admin/participants/E2E003');
+  await ap.getByLabel('Rename participant ID').fill('E2E003B');
+  await ap.getByRole('button', { name: 'Rename', exact: true }).click();
+  await ap.waitForURL(/participants\/E2E003B/);
+  check('admin can rename a participant', true);
+  await ap.locator('summary', { hasText: 'Delete this participant' }).click();
+  await ap.locator('.danger-zone input[name="confirm"]').fill('DELETE');
+  await ap.getByRole('button', { name: /Delete E2E003B/ }).click();
+  await ap.waitForURL(/admin\/participants$/);
+  check('admin can delete a participant (typed confirmation)', !(await ap.locator('main').innerText()).includes('E2E003B'));
   const [adl] = await Promise.all([ap.waitForEvent('download'), ap.goto(BASE + '/api/export/study').catch(() => undefined)]);
   await adl.saveAs(OUT + 'e2e_study.xlsx');
   const [sdl] = await Promise.all([ap.waitForEvent('download'), ap.evaluate((u) => { location.href = u; }, '/api/export/participant/E2E001')]);

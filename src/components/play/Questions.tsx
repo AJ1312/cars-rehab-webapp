@@ -1,6 +1,9 @@
 'use client';
 import { useState } from 'react';
 import type { StoredSession } from '@/lib/client/local';
+import core from '@/lib/core';
+
+const TAGS = core.ADVERSE_TAGS as { key: 'shoulder_pain' | 'elbow_pain' | 'fatigue' | 'dizziness' | 'other'; label: string }[];
 
 const QS: [string, string][] = [
   ['Q1', 'Did you enjoy your experience with the system?'],
@@ -16,13 +19,14 @@ export function Questions({ stored, onSave }: { stored: StoredSession; onSave: (
   const [a, setA] = useState<Record<string, number>>({});
   const [neg, setNeg] = useState(''); const [sug, setSug] = useState('');
   const [adverse, setAdverse] = useState(''); const [notes, setNotes] = useState('');
+  const [tags, setTags] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
 
   function save(skip: boolean) {
     setBusy(true);
     const answered = Object.keys(a).length > 0 || neg.trim() || sug.trim();
     const questionnaire = !skip && answered ? { ...a, ...(neg.trim() ? { negative: neg.trim().slice(0, 1000) } : {}), ...(sug.trim() ? { suggestions: sug.trim().slice(0, 1000) } : {}) } : null;
-    onSave({ ...stored, record: { ...stored.record, questionnaire, adverse: adverse.trim().slice(0, 1000), notes: notes.trim().slice(0, 2000) } });
+    onSave({ ...stored, record: { ...stored.record, questionnaire, adverseTags: tags as typeof TAGS[number]['key'][], adverse: adverse.trim().slice(0, 1000), notes: notes.trim().slice(0, 2000) } });
   }
 
   return (
@@ -51,7 +55,16 @@ export function Questions({ stored, onSave }: { stored: StoredSession; onSave: (
 
       <div className="panel soft">
         <h3>Therapist notes</h3>
-        <div className="field"><label htmlFor="adv">Adverse events</label><textarea id="adv" className="input" value={adverse} onChange={(e) => setAdverse(e.target.value)} maxLength={1000} placeholder="Leave empty if none" /><span className="hint">Do not enter names or contact details.</span></div>
+        <fieldset className="field" style={{ border: 0, padding: 0, margin: 0 }}>
+          <legend className="label" style={{ fontFamily: 'var(--font-display)', fontWeight: 700, padding: 0, marginBottom: 6 }}>Did anything happen during the session?</legend>
+          <div className="tagpick">
+            {TAGS.map((t) => (
+              <label key={t.key} className="check"><input type="checkbox" checked={tags.includes(t.key)} onChange={(e) => setTags(e.target.checked ? [...tags, t.key] : tags.filter((x) => x !== t.key))} /><span>{t.label}</span></label>
+            ))}
+          </div>
+          <span className="hint">Leave all unticked if nothing happened.</span>
+        </fieldset>
+        <div className="field"><label htmlFor="adv">Adverse events, in words</label><textarea id="adv" className="input" value={adverse} onChange={(e) => setAdverse(e.target.value)} maxLength={1000} placeholder="Leave empty if none" /><span className="hint">Do not enter names or contact details.</span></div>
         <div className="field"><label htmlFor="nts">Session notes</label><textarea id="nts" className="input" value={notes} onChange={(e) => setNotes(e.target.value)} maxLength={2000} /></div>
       </div>
 

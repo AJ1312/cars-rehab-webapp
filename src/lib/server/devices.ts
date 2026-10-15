@@ -1,17 +1,23 @@
-import QRCode from 'qrcode';
-import { enrolCode, normaliseCode, sha256 } from './crypto';
+import { randomToken, sha256 } from './crypto';
 import { getStore } from './store';
 import type { Staff } from './types';
 
-/** One-time enrolment code (24 h) for a study phone, with the QR code that carries it. Only the code's hash is stored. */
-export async function createEnrolment(staff: Staff, label: string, origin: string, ip: string | null) {
-  const code = enrolCode();
-  const expires = new Date(Date.now() + 24 * 3600_000).toISOString();
+/** A readable name for a phone, taken from its browser string: "iPhone · Safari · 7F3A". The 4 characters tell two phones of the same kind apart. */
+export function deviceLabelFromUa(ua: string, tokenHash: string): string {
+  const u = ua || '';
+  const kind = /iPhone/i.test(u) ? 'iPhone' : /iPad/i.test(u) ? 'iPad' : /Android/i.test(u) ? 'Android' : /Mac OS X|Windows|Linux|CrOS/i.test(u) ? 'Computer' : 'Phone';
+  const browser = /SamsungBrowser/i.test(u) ? 'Samsung Internet' : /EdgA|EdgiOS|Edg\//i.test(u) ? 'Edge' : /FxiOS|Firefox/i.test(u) ? 'Firefox' : /CriOS|Chrome/i.test(u) ? 'Chrome' : /Safari/i.test(u) ? 'Safari' : 'Browser';
+  return `${kind} · ${browser} · ${tokenHash.slice(0, 4).toUpperCase()}`;
+}
+
+/** Called by a phone the first time it has something to upload. Only the token's hash is stored, so a database leak does not expose working tokens. */
+export async function registerDevice(ua: string, ip: string | null) {
   const store = getStore();
-  const device = await store.createEnrolment({ label, codeHash: sha256(normaliseCode(code)), expiresAt: expires, createdBy: staff.id });
-  await store.addAudit({ actor: staff.email, action: 'device.enrolment_created', target: device.id, detail: { label }, ip });
-  const url = `${origin}/enrol?code=${code}`;
-  return { device, code, url, expires, qr: await QRCode.toDataURL(url, { margin: 1, width: 280, errorCorrectionLevel: 'M' }) };
+  const token = randomToken('cars_');
+  const tokenHash = sha256(token);
+  const device = await store.registerDevice({ label: deviceLabelFromUa(ua, tokenHash), tokenHash, model: ua.slice(0, 190) || null });
+  await store.addAudit({ actor: 'device:' + device.label, action: 'device.registered', target: device.id, ip });
+  return { device, token, settings: await store.getSettings() };
 }
 
 export async function revokeDevice(staff: Staff, id: string, ip: string | null) {
